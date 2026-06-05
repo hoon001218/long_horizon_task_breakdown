@@ -6,6 +6,30 @@
 
 ---
 
+## 0. 웹 UI 실행 방법
+
+### Requirements
+
+```bash
+pip install flask python-dotenv numpy matplotlib pandas
+```
+
+Flask 기반 웹 UI는 `app.py`로 실행할 수 있습니다.
+
+```bash
+python app.py
+```
+
+기본 Ollama 엔드포인트는 `http://localhost:11434/api/chat`이며, 필요하면 다음 환경변수로 바꿀 수 있습니다.
+
+- `OLLAMA_URL`: Ollama chat endpoint
+- `OLLAMA_MODEL`: 사용할 모델 이름
+- `DEFAULT_SYSTEM_PROMPT`: 서버 기본 시스템 프롬프트
+
+정적 파일은 `static/html`, `static/css`, `static/js`로 분리되어 있습니다.
+
+---
+
 ## 1. 개요 (Overview)
 
 ### 해결하고자 하는 문제 (Problem Statement)
