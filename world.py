@@ -23,9 +23,9 @@ import time
 from dataclasses import dataclass
 
 # Object count controls.
-NUM_CUBES = 2
-NUM_CAPSULES = 2
-NUM_SPHERES = 2
+NUM_CUBES = 4
+NUM_CAPSULES = 3
+NUM_SPHERES = 4
 OBJECT_SIZE_SCALE = 0.5
 OBJECT_SPAWN_DELAY_SEC = 1.0
 
@@ -45,6 +45,10 @@ JOINT_STATE_TOPICS = {
 ROBOT_POSE_TOPICS = {
     "left": "/franka_left/pose",
     "right": "/franka_right/pose",
+}
+EEF_POSE_TOPICS = {
+    "left": "/franka_left/end_effector_pose",
+    "right": "/franka_right/end_effector_pose",
 }
 JOINT_STATE_PUBLISH_HZ = 30.0
 CONTROL_SERVICE_TOPICS = {
@@ -522,27 +526,61 @@ class CustomScene:
         self.add_goal_zones(table_material)
 
     def add_table_rims(self, table_material: PhysicsMaterial | None) -> None:
-        material_kwargs = {} if table_material is None else {"physics_material": table_material}
+        material_kwargs = (
+            {} if table_material is None else {"physics_material": table_material}
+        )
         rim_z = TABLE_TOP_Z + TABLE_RIM_HEIGHT / 2.0
         rim_specs = [
             (
                 "x_min",
-                np.array([TABLE_CENTER[0] - TABLE_DIMS[0] / 2.0 + TABLE_RIM_THICKNESS / 2.0, TABLE_CENTER[1], rim_z]),
+                np.array(
+                    [
+                        TABLE_CENTER[0]
+                        - TABLE_DIMS[0] / 2.0
+                        + TABLE_RIM_THICKNESS / 2.0,
+                        TABLE_CENTER[1],
+                        rim_z,
+                    ]
+                ),
                 np.array([TABLE_RIM_THICKNESS, TABLE_DIMS[1], TABLE_RIM_HEIGHT]),
             ),
             (
                 "x_max",
-                np.array([TABLE_CENTER[0] + TABLE_DIMS[0] / 2.0 - TABLE_RIM_THICKNESS / 2.0, TABLE_CENTER[1], rim_z]),
+                np.array(
+                    [
+                        TABLE_CENTER[0]
+                        + TABLE_DIMS[0] / 2.0
+                        - TABLE_RIM_THICKNESS / 2.0,
+                        TABLE_CENTER[1],
+                        rim_z,
+                    ]
+                ),
                 np.array([TABLE_RIM_THICKNESS, TABLE_DIMS[1], TABLE_RIM_HEIGHT]),
             ),
             (
                 "y_min",
-                np.array([TABLE_CENTER[0], TABLE_CENTER[1] - TABLE_DIMS[1] / 2.0 + TABLE_RIM_THICKNESS / 2.0, rim_z]),
+                np.array(
+                    [
+                        TABLE_CENTER[0],
+                        TABLE_CENTER[1]
+                        - TABLE_DIMS[1] / 2.0
+                        + TABLE_RIM_THICKNESS / 2.0,
+                        rim_z,
+                    ]
+                ),
                 np.array([TABLE_DIMS[0], TABLE_RIM_THICKNESS, TABLE_RIM_HEIGHT]),
             ),
             (
                 "y_max",
-                np.array([TABLE_CENTER[0], TABLE_CENTER[1] + TABLE_DIMS[1] / 2.0 - TABLE_RIM_THICKNESS / 2.0, rim_z]),
+                np.array(
+                    [
+                        TABLE_CENTER[0],
+                        TABLE_CENTER[1]
+                        + TABLE_DIMS[1] / 2.0
+                        - TABLE_RIM_THICKNESS / 2.0,
+                        rim_z,
+                    ]
+                ),
                 np.array([TABLE_DIMS[0], TABLE_RIM_THICKNESS, TABLE_RIM_HEIGHT]),
             ),
         ]
@@ -560,7 +598,9 @@ class CustomScene:
             )
 
     def add_goal_zones(self, table_material: PhysicsMaterial | None) -> None:
-        material_kwargs = {} if table_material is None else {"physics_material": table_material}
+        material_kwargs = (
+            {} if table_material is None else {"physics_material": table_material}
+        )
         for robot_id, zone in GOAL_ZONES.items():
             center = zone["center"]
             name = zone["name"]
@@ -585,27 +625,53 @@ class CustomScene:
         goal_center: np.ndarray,
         table_material: PhysicsMaterial | None,
     ) -> None:
-        material_kwargs = {} if table_material is None else {"physics_material": table_material}
+        material_kwargs = (
+            {} if table_material is None else {"physics_material": table_material}
+        )
         rim_z = TABLE_TOP_Z + GOAL_RIM_HEIGHT / 2.0 + GOAL_DIMS[2]
         rim_specs = [
             (
                 "left",
-                np.array([goal_center[0] - GOAL_DIMS[0] / 2.0 + GOAL_RIM_THICKNESS / 2.0, goal_center[1], rim_z]),
+                np.array(
+                    [
+                        goal_center[0] - GOAL_DIMS[0] / 2.0 + GOAL_RIM_THICKNESS / 2.0,
+                        goal_center[1],
+                        rim_z,
+                    ]
+                ),
                 np.array([GOAL_RIM_THICKNESS, GOAL_DIMS[1], GOAL_RIM_HEIGHT]),
             ),
             (
                 "right",
-                np.array([goal_center[0] + GOAL_DIMS[0] / 2.0 - GOAL_RIM_THICKNESS / 2.0, goal_center[1], rim_z]),
+                np.array(
+                    [
+                        goal_center[0] + GOAL_DIMS[0] / 2.0 - GOAL_RIM_THICKNESS / 2.0,
+                        goal_center[1],
+                        rim_z,
+                    ]
+                ),
                 np.array([GOAL_RIM_THICKNESS, GOAL_DIMS[1], GOAL_RIM_HEIGHT]),
             ),
             (
                 "front",
-                np.array([goal_center[0], goal_center[1] - GOAL_DIMS[1] / 2.0 + GOAL_RIM_THICKNESS / 2.0, rim_z]),
+                np.array(
+                    [
+                        goal_center[0],
+                        goal_center[1] - GOAL_DIMS[1] / 2.0 + GOAL_RIM_THICKNESS / 2.0,
+                        rim_z,
+                    ]
+                ),
                 np.array([GOAL_DIMS[0], GOAL_RIM_THICKNESS, GOAL_RIM_HEIGHT]),
             ),
             (
                 "back",
-                np.array([goal_center[0], goal_center[1] + GOAL_DIMS[1] / 2.0 - GOAL_RIM_THICKNESS / 2.0, rim_z]),
+                np.array(
+                    [
+                        goal_center[0],
+                        goal_center[1] + GOAL_DIMS[1] / 2.0 - GOAL_RIM_THICKNESS / 2.0,
+                        rim_z,
+                    ]
+                ),
                 np.array([GOAL_DIMS[0], GOAL_RIM_THICKNESS, GOAL_RIM_HEIGHT]),
             ),
         ]
@@ -966,9 +1032,15 @@ class RosMessageCodec:
         return writer.to_bytes()
 
     @staticmethod
-    def serialize_pose(position: np.ndarray, orientation_wxyz: np.ndarray) -> bytes:
+    def serialize_pose_stamped(
+        position: np.ndarray, orientation_wxyz: np.ndarray, frame_id: str
+    ) -> bytes:
         qx, qy, qz, qw = QuaternionUtils.wxyz_to_xyzw(orientation_wxyz)
+        now = time.time()
+        sec = int(now)
+        nanosec = int((now - sec) * 1_000_000_000)
         writer = CdrWriter()
+        writer.write_header(sec, nanosec, frame_id)
         writer.write_float64(float(position[0]))
         writer.write_float64(float(position[1]))
         writer.write_float64(float(position[2]))
@@ -1127,6 +1199,7 @@ class RosTcpClientBase:
         control_mode: str,
         joint_topics: dict[str, str],
         robot_pose_topics: dict[str, str],
+        eef_pose_topics: dict[str, str],
         marker_topic: str,
         image_topic: str,
         camera_pose_topic: str,
@@ -1148,6 +1221,10 @@ class RosTcpClientBase:
         self.robot_pose_topics = {
             robot_id: RosTopic.normalize(topic)
             for robot_id, topic in robot_pose_topics.items()
+        }
+        self.eef_pose_topics = {
+            robot_id: RosTopic.normalize(topic)
+            for robot_id, topic in eef_pose_topics.items()
         }
         self.joint_topic = next(iter(self.joint_topics.values()))
         self.marker_topic = RosTopic.normalize(marker_topic)
@@ -1263,6 +1340,8 @@ class RosTcpClientBase:
             )
             for pose_topic in self.robot_pose_topics.values():
                 self.register_pose_publisher(pose_topic)
+            for pose_topic in self.eef_pose_topics.values():
+                self.register_pose_publisher(pose_topic)
             self.register_pose_publisher(self.camera_pose_topic)
             if not self.connected or self.socket is not sock:
                 raise ConnectionError(
@@ -1320,7 +1399,7 @@ class RosTcpClientBase:
             "__publish",
             {
                 "topic": topic,
-                "message_name": "geometry_msgs/Pose",
+                "message_name": "geometry_msgs/PoseStamped",
                 "queue_size": 10,
                 "latch": False,
             },
@@ -1434,7 +1513,10 @@ class RosTcpClientBase:
             self.logged_first_camera_image = True
 
     def publish_pose_if_due(
-        self, robots: dict[str, Robot], camera: Camera | None
+        self,
+        robots: dict[str, Robot],
+        eef_poses: dict[str, tuple[np.ndarray, np.ndarray]],
+        camera: Camera | None,
     ) -> None:
         if not self.try_connect():
             return
@@ -1448,17 +1530,28 @@ class RosTcpClientBase:
             if topic is None:
                 continue
             position, orientation = robot.get_world_pose()
-            payload = RosMessageCodec.serialize_pose(
+            payload = RosMessageCodec.serialize_pose_stamped(
                 np.array(position, dtype=np.float64),
                 np.array(orientation, dtype=np.float64),
+                self.frame_id,
+            )
+            self.send_packet(topic, payload)
+
+        for robot_id, (position, orientation) in eef_poses.items():
+            topic = self.eef_pose_topics.get(robot_id)
+            if topic is None:
+                continue
+            payload = RosMessageCodec.serialize_pose_stamped(
+                position, orientation, self.frame_id
             )
             self.send_packet(topic, payload)
 
         if camera is not None:
             position, orientation = camera.get_world_pose()
-            payload = RosMessageCodec.serialize_pose(
+            payload = RosMessageCodec.serialize_pose_stamped(
                 np.array(position, dtype=np.float64),
                 np.array(orientation, dtype=np.float64),
+                self.frame_id,
             )
             self.send_packet(self.camera_pose_topic, payload)
 
@@ -1740,6 +1833,13 @@ class AutoController(BaseController):
             ),
         )
 
+    def get_end_effector_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        position, rotation = self.compute_current_ee_pose(position_only=False)
+        orientation = rot_matrices_to_quats(rotation)
+        return np.array(position, dtype=np.float64), np.array(
+            orientation, dtype=np.float64
+        )
+
     def step(self, ros_client: RosTcpClientBase) -> None:
         self.process_service_requests(ros_client)
         self.step_motion()
@@ -1906,8 +2006,8 @@ class AutoController(BaseController):
 
     def stop(self) -> ControlCommandResponse:
         self.phase_dwell_until = None
-        current_position, current_rotation = (
-            self.compute_current_ee_pose(position_only=False)
+        current_position, current_rotation = self.compute_current_ee_pose(
+            position_only=False
         )
         current_orientation = rot_matrices_to_quats(current_rotation)
         vertical_position = np.array(current_position, dtype=np.float64)
@@ -1993,11 +2093,13 @@ def main() -> None:
 
     ros_tcp_client: RosTcpClientBase
     controllers: list[BaseController]
+    auto_controllers: dict[str, AutoController] = {}
     ros_kwargs = {
         "host": ROS_TCP_HOST,
         "port": ROS_TCP_PORT,
         "joint_topics": JOINT_STATE_TOPICS,
         "robot_pose_topics": ROBOT_POSE_TOPICS,
+        "eef_pose_topics": EEF_POSE_TOPICS,
         "marker_topic": MARKER_TOPIC,
         "image_topic": RGB_CAMERA_TOPIC,
         "camera_pose_topic": CAMERA_POSE_TOPIC,
@@ -2018,6 +2120,11 @@ def main() -> None:
             AutoController(scene.frankas[robot_id], CONTROL_SERVICE_TOPICS[robot_id])
             for robot_id in ("left", "right")
         ]
+        auto_controllers = {
+            robot_id: controller
+            for robot_id, controller in zip(("left", "right"), controllers)
+            if isinstance(controller, AutoController)
+        }
         for controller in controllers:
             if isinstance(controller, AutoController):
                 controller.ensure_home_pose()
@@ -2038,7 +2145,13 @@ def main() -> None:
             for controller in controllers:
                 controller.step(ros_tcp_client)
             ros_tcp_client.publish_joint_state_if_due(scene.frankas)
-            ros_tcp_client.publish_pose_if_due(scene.frankas, scene.top_camera)
+            eef_poses = {
+                robot_id: controller.get_end_effector_pose()
+                for robot_id, controller in auto_controllers.items()
+            }
+            ros_tcp_client.publish_pose_if_due(
+                scene.frankas, eef_poses, scene.top_camera
+            )
             ros_tcp_client.publish_camera_if_due(scene.top_camera)
             ros_tcp_client.publish_if_due()
 
