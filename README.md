@@ -26,6 +26,8 @@ python app.py
 - `OLLAMA_MODEL`: 사용할 모델 이름
 - `DEFAULT_SYSTEM_PROMPT`: 서버 기본 시스템 프롬프트
 
+주의: `OLLAMA_MODEL`은 Ollama에서 `vision` capability로 인식되는 모델이어야 이미지와 텍스트를 함께 받을 수 있습니다. 현재 서버는 `/api/show`로 capability를 확인하고, vision 지원이 없으면 요청 전에 명확한 오류를 반환합니다.
+
 정적 파일은 `static/html`, `static/css`, `static/js`로 분리되어 있습니다.
 
 ---

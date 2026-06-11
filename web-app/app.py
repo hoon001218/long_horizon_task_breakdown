@@ -73,6 +73,7 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+_OLLAMA_MODEL_CAPABILITIES_CACHE: dict[str, list[str]] = {}
 
 
 def _strip_code_fences(text: str) -> str:
@@ -129,6 +130,26 @@ def _image_data_url(image_bytes: bytes, image_mimetype: str) -> str:
     return f"data:{image_mimetype};base64,{encoded_image}"
 
 
+def _get_ollama_model_capabilities(model_name: str) -> list[str]:
+    cached_capabilities = _OLLAMA_MODEL_CAPABILITIES_CACHE.get(model_name)
+    if cached_capabilities is not None:
+        return cached_capabilities
+
+    response_payload = _post_json(
+        f"{OLLAMA_URL.rsplit('/api/chat', 1)[0]}/api/show",
+        {"model": model_name},
+        {},
+    )
+    capabilities = response_payload.get("capabilities")
+    normalized_capabilities = [str(capability).strip().lower() for capability in capabilities if isinstance(capability, str)] if isinstance(capabilities, list) else []
+    _OLLAMA_MODEL_CAPABILITIES_CACHE[model_name] = normalized_capabilities
+    return normalized_capabilities
+
+
+def _ollama_model_supports_vision(model_name: str) -> bool:
+    return "vision" in _get_ollama_model_capabilities(model_name)
+
+
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = 120) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request_object = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **headers}, method="POST")
@@ -146,6 +167,15 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeo
 
 
 def call_ollama_with_image(image_bytes: bytes, image_mimetype: str, user_prompt: str, system_prompt: str) -> dict:
+    if not _ollama_model_supports_vision(OLLAMA_MODEL):
+        capabilities = ", ".join(_get_ollama_model_capabilities(OLLAMA_MODEL)) or "none"
+        raise RuntimeError(
+            "현재 OLLAMA_MODEL은 Ollama에서 vision capability로 인식되지 않습니다. "
+            f"model={OLLAMA_MODEL}, capabilities={capabilities}. "
+            "이 요청은 형식상 올바르지만, 이 모델은 이미지 입력을 받을 수 없어서 Ollama가 거절합니다. "
+            "vision 지원 모델을 사용하거나, 모델을 vision capability로 재생성한 뒤 다시 시도하세요."
+        )
+
     payload = {
         "model": OLLAMA_MODEL,
         "stream": False,
