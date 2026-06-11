@@ -72,7 +72,9 @@ class JointStatePublisher(Node):
 
 
 class JointStateGui:
-    def __init__(self, root: tk.Tk, node: JointStatePublisher, topic: str, publish_hz: float) -> None:
+    def __init__(
+        self, root: tk.Tk, node: JointStatePublisher, topic: str, publish_hz: float
+    ) -> None:
         self.root = root
         self.node = node
         self.topic = topic
@@ -95,10 +97,14 @@ class JointStateGui:
         self.root.rowconfigure(0, weight=1)
         main.columnconfigure(1, weight=1)
 
-        title = ttk.Label(main, text="Franka JointState Publisher", font=("", 15, "bold"))
+        title = ttk.Label(
+            main, text="Franka JointState Publisher", font=("", 15, "bold")
+        )
         title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-        topic_label = ttk.Label(main, text=f"Topic: {self.topic}   Rate: {self.publish_hz:.1f} Hz")
+        topic_label = ttk.Label(
+            main, text=f"Topic: {self.topic}   Rate: {self.publish_hz:.1f} Hz"
+        )
         topic_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
         for index, joint in enumerate(FRANKA_JOINTS, start=2):
@@ -123,15 +129,33 @@ class JointStateGui:
             self._update_value_label(index - 2)
 
         controls = ttk.Frame(main)
-        controls.grid(row=len(FRANKA_JOINTS) + 2, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        controls.grid(
+            row=len(FRANKA_JOINTS) + 2,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(14, 0),
+        )
         controls.columnconfigure(6, weight=1)
 
-        ttk.Checkbutton(controls, text="Publish", variable=self.publish_enabled).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(controls, text="Home", command=lambda: self._apply_preset("home")).grid(row=0, column=1, padx=4)
-        ttk.Button(controls, text="Zero", command=lambda: self._apply_preset("zero")).grid(row=0, column=2, padx=4)
-        ttk.Button(controls, text="Ready", command=lambda: self._apply_preset("ready")).grid(row=0, column=3, padx=4)
-        ttk.Button(controls, text="Open", command=lambda: self._apply_preset("gripper_open")).grid(row=0, column=4, padx=4)
-        ttk.Button(controls, text="Close", command=lambda: self._apply_preset("gripper_closed")).grid(row=0, column=5, padx=4)
+        ttk.Checkbutton(controls, text="Publish", variable=self.publish_enabled).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        ttk.Button(
+            controls, text="Home", command=lambda: self._apply_preset("home")
+        ).grid(row=0, column=1, padx=4)
+        ttk.Button(
+            controls, text="Zero", command=lambda: self._apply_preset("zero")
+        ).grid(row=0, column=2, padx=4)
+        ttk.Button(
+            controls, text="Ready", command=lambda: self._apply_preset("ready")
+        ).grid(row=0, column=3, padx=4)
+        ttk.Button(
+            controls, text="Open", command=lambda: self._apply_preset("gripper_open")
+        ).grid(row=0, column=4, padx=4)
+        ttk.Button(
+            controls, text="Close", command=lambda: self._apply_preset("gripper_closed")
+        ).grid(row=0, column=5, padx=4)
 
         self.status = ttk.Label(controls, text="Publishing", anchor="e")
         self.status.grid(row=0, column=6, sticky="e")
@@ -177,9 +201,17 @@ class JointStateGui:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GUI JointState publisher for the Isaac Sim Franka scene.")
-    parser.add_argument("--topic", default="/joint_states", help="JointState topic to publish. Default: /joint_states")
-    parser.add_argument("--rate", type=float, default=30.0, help="Publish rate in Hz. Default: 30")
+    parser = argparse.ArgumentParser(
+        description="GUI JointState publisher for the Isaac Sim Franka scene."
+    )
+    parser.add_argument(
+        "--topic",
+        default="/joint_states",
+        help="JointState topic to publish. Default: /joint_states",
+    )
+    parser.add_argument(
+        "--rate", type=float, default=30.0, help="Publish rate in Hz. Default: 30"
+    )
     return parser.parse_args()
 
 

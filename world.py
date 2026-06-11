@@ -4,13 +4,13 @@ Run this file with Isaac Sim's bundled Python, for example:
 
     ./isaac-sim/python.sh world.py
 
-The script creates a fixed Franka robot, a cuboid table, and randomized small
+The script creates two fixed Franka robots, a cuboid table, and randomized small
 objects on the table. Isaac Sim connects as a TCP client to an already-running
 ROS-TCP-Endpoint server and:
 
 * Manual mode subscribes to ``sensor_msgs/msg/JointState`` on ``/joint_states``;
 * Auto mode serves ``custom_msgs/srv/ControlCommand`` and publishes ``/joint_states``;
-* both modes publish ``visualization_msgs/msg/MarkerArray`` with object poses.
+* both modes publish ``visualization_msgs/msg/MarkerArray`` and a top-view RGB image.
 """
 
 from isaacsim import SimulationApp
@@ -27,17 +27,40 @@ NUM_CUBES = 2
 NUM_CAPSULES = 2
 NUM_SPHERES = 2
 OBJECT_SIZE_SCALE = 0.5
+OBJECT_SPAWN_DELAY_SEC = 1.0
 
 MARKER_TOPIC = "/world/object_markers"
 MARKER_FRAME_ID = "world"
 MARKER_PUBLISH_HZ = 15.0
+RGB_CAMERA_TOPIC = "/world/top_camera/image_raw"
+RGB_CAMERA_PUBLISH_HZ = 8.0
+RGB_CAMERA_RESOLUTION = (640, 480)
+CAMERA_POSE_TOPIC = "/world/top_camera/pose"
 ROS_TCP_HOST = "127.0.0.1"
 ROS_TCP_PORT = 10000
-JOINT_STATE_TOPIC = "/joint_states"
+JOINT_STATE_TOPICS = {
+    "left": "/franka_left/joint_states",
+    "right": "/franka_right/joint_states",
+}
+ROBOT_POSE_TOPICS = {
+    "left": "/franka_left/pose",
+    "right": "/franka_right/pose",
+}
 JOINT_STATE_PUBLISH_HZ = 30.0
-CONTROL_SERVICE_TOPIC = "/control_command"
+CONTROL_SERVICE_TOPICS = {
+    "left": "/franka_left/control_command",
+    "right": "/franka_right/control_command",
+}
 CONTROL_SERVICE_TYPE = "custom_msgs/ControlCommand"
 CONTROL_SERVICE_TIMEOUT = 5.0
+ROS_TCP_RECONNECT_PERIOD_SEC = 3.0
+
+ACTION_MOVING = "Moving"
+ACTION_CENTERING = "Centering"
+ACTION_PLACING = "Placing"
+ACTION_GRIP = "Grip"
+ACTION_REALEASE = "Realease"
+ACTION_HOMING = "Homing"
 
 CONTROL_MODE = "auto"  # "manual" or "auto"
 HEADLESS = False
@@ -51,6 +74,16 @@ GRIPPER_JOINT_NAMES = ["panda_finger_joint1", "panda_finger_joint2"]
 AUTO_MOVE_POSITION_TOLERANCE = 0.012
 AUTO_MOVE_ORIENTATION_TOLERANCE = 0.1
 AUTO_MOVE_DWELL_SEC = 0.5
+
+OBJECT_COLORS = {
+    "red": (0.95, 0.05, 0.05),
+    "blue": (0.05, 0.25, 0.95),
+}
+
+TOP_CAMERA_PRIM_PATH = "/World/TopCamera"
+TOP_CAMERA_POSITION = (0.6, 0.0, 1.18)
+TOP_CAMERA_EULER_DEGREES = (0.0, 90.0, 0.0)
+TOP_CAMERA_FOCAL_LENGTH = 12.0
 
 simulation_app = SimulationApp({"renderer": "RaytracedLighting", "headless": HEADLESS})
 
@@ -68,20 +101,84 @@ from isaacsim.core.api.objects import (
 )
 from isaacsim.core.api.robots import Robot
 from isaacsim.core.utils import viewports
-from isaacsim.core.utils.numpy.rotations import rot_matrices_to_quats
-from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.core.utils.numpy.rotations import (
+    euler_angles_to_quats,
+    rot_matrices_to_quats,
+)
+from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.robot.manipulators.examples.franka.kinematics_solver import (
     KinematicsSolver as FrankaKinematicsSolver,
 )
+from isaacsim.sensors.camera import Camera
 from isaacsim.storage.native import get_assets_root_path
+from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux
 
-FRANKA_PRIM_PATH = "/World/Franka"
 FRANKA_USD_PATH = "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
+ROBOT_CONFIGS = {
+    "left": {
+        "prim_path": "/World/FrankaLeft",
+        "name": "franka_left",
+        "position": np.array([0.0, 0.0, 0.0]),
+        "orientation": np.array([1.0, 0.0, 0.0, 0.0]),
+    },
+    "right": {
+        "prim_path": "/World/FrankaRight",
+        "name": "franka_right",
+        "position": np.array([1.2, 0.0, 0.0]),
+        "orientation": np.array([0.0, 0.0, 0.0, 1.0]),
+    },
+}
 
 TABLE_DIMS = np.array([0.9, 0.7, 0.08])
 TABLE_CENTER = np.array([0.6, 0.0, 0.38])
 TABLE_TOP_Z = TABLE_CENTER[2] + TABLE_DIMS[2] / 2.0
+TABLE_RIM_THICKNESS = 0.025
+TABLE_RIM_HEIGHT = 0.0165
+TABLE_RIM_COLOR = np.array([0.38, 0.30, 0.22])
+GOAL_SIDE_LENGTH = 0.154
+GOAL_DIMS = np.array([GOAL_SIDE_LENGTH, GOAL_SIDE_LENGTH, 0.008])
+GOAL_RIM_THICKNESS = 0.018
+GOAL_RIM_HEIGHT = 0.0105
+GOAL_TARGET_Z = TABLE_TOP_Z + GOAL_RIM_HEIGHT + 0.035
+GOAL_CORNER_MARGIN = 0.045
+GOAL_ZONES = {
+    "left": {
+        "name": "red_goal",
+        "center": np.array(
+            [
+                TABLE_CENTER[0]
+                - TABLE_DIMS[0] / 2.0
+                + GOAL_CORNER_MARGIN
+                + GOAL_SIDE_LENGTH / 2.0,
+                TABLE_CENTER[1]
+                + TABLE_DIMS[1] / 2.0
+                - GOAL_CORNER_MARGIN
+                - GOAL_SIDE_LENGTH / 2.0,
+                TABLE_TOP_Z + GOAL_DIMS[2] / 2.0,
+            ]
+        ),
+        "color": np.array(OBJECT_COLORS["red"]),
+    },
+    "right": {
+        "name": "blue_goal",
+        "center": np.array(
+            [
+                TABLE_CENTER[0]
+                + TABLE_DIMS[0] / 2.0
+                - GOAL_CORNER_MARGIN
+                - GOAL_SIDE_LENGTH / 2.0,
+                TABLE_CENTER[1]
+                - TABLE_DIMS[1] / 2.0
+                + GOAL_CORNER_MARGIN
+                + GOAL_SIDE_LENGTH / 2.0,
+                TABLE_TOP_Z + GOAL_DIMS[2] / 2.0,
+            ]
+        ),
+        "color": np.array(OBJECT_COLORS["blue"]),
+    },
+}
+OBJECT_LINEAR_DAMPING = 10.0
 
 ROBOT_WORKSPACE_X_RANGE = (0.32, 0.84)
 ROBOT_WORKSPACE_Y_RANGE = (-0.26, 0.26)
@@ -142,6 +239,7 @@ class ControlCommandResponse:
 
 @dataclass
 class PendingServiceRequest:
+    service_topic: str
     srv_id: int
     request: ControlCommandRequest
     done_event: threading.Event
@@ -160,209 +258,466 @@ class SpawnSpec:
     z: float
 
 
-def normalize_ros_topic(raw_topic_name: str) -> str:
-    if not raw_topic_name:
-        raise ValueError("ROS topic name must not be empty.")
-    return raw_topic_name if raw_topic_name.startswith("/") else f"/{raw_topic_name}"
+class RosTopic:
+    @staticmethod
+    def normalize(raw_topic_name: str) -> str:
+        if not raw_topic_name:
+            raise ValueError("ROS topic name must not be empty.")
+        return (
+            raw_topic_name if raw_topic_name.startswith("/") else f"/{raw_topic_name}"
+        )
 
 
-def random_yaw_quaternion(rng: np.random.Generator) -> np.ndarray:
-    yaw = float(rng.uniform(-np.pi, np.pi))
-    half_yaw = yaw * 0.5
-    return np.array([np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)])
+class QuaternionUtils:
+    @staticmethod
+    def random_yaw(rng: np.random.Generator) -> np.ndarray:
+        yaw = float(rng.uniform(-np.pi, np.pi))
+        half_yaw = yaw * 0.5
+        return np.array([np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)])
+
+    @staticmethod
+    def multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        lw, lx, ly, lz = left
+        rw, rx, ry, rz = right
+        return np.array(
+            [
+                lw * rw - lx * rx - ly * ry - lz * rz,
+                lw * rx + lx * rw + ly * rz - lz * ry,
+                lw * ry - lx * rz + ly * rw + lz * rx,
+                lw * rz + lx * ry - ly * rx + lz * rw,
+            ]
+        )
+
+    @staticmethod
+    def random_horizontal_capsule(rng: np.random.Generator) -> np.ndarray:
+        yaw = QuaternionUtils.random_yaw(rng)
+        pitch_90 = np.array([np.sqrt(0.5), 0.0, np.sqrt(0.5), 0.0])
+        return QuaternionUtils.multiply(yaw, pitch_90)
+
+    @staticmethod
+    def wxyz_to_xyzw(orientation: np.ndarray) -> tuple[float, float, float, float]:
+        return (
+            float(orientation[1]),
+            float(orientation[2]),
+            float(orientation[3]),
+            float(orientation[0]),
+        )
+
+    @staticmethod
+    def xyzw_to_wxyz(quaternion: np.ndarray) -> np.ndarray | None:
+        norm = float(np.linalg.norm(quaternion))
+        if norm < 1.0e-6:
+            return None
+        x, y, z, w = quaternion / norm
+        return np.array([w, x, y, z], dtype=np.float64)
+
+    @staticmethod
+    def angular_distance_wxyz(left: np.ndarray, right: np.ndarray) -> float:
+        left_norm = left / max(float(np.linalg.norm(left)), 1.0e-9)
+        right_norm = right / max(float(np.linalg.norm(right)), 1.0e-9)
+        dot = float(np.clip(abs(np.dot(left_norm, right_norm)), -1.0, 1.0))
+        return 2.0 * float(np.arccos(dot))
 
 
-def quaternion_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    lw, lx, ly, lz = left
-    rw, rx, ry, rz = right
-    return np.array(
-        [
-            lw * rw - lx * rx - ly * ry - lz * rz,
-            lw * rx + lx * rw + ly * rz - lz * ry,
-            lw * ry - lx * rz + ly * rw + lz * rx,
-            lw * rz + lx * ry - ly * rx + lz * rw,
-        ]
-    )
+class CustomScene:
+    def __init__(self, seed: int | None) -> None:
+        self.seed = seed
+        self.world = World(stage_units_in_meters=1.0)
+        self.frankas: dict[str, Robot] = {}
+        self.top_camera: Camera | None = None
+        self.object_material: PhysicsMaterial | None = None
+        self.spawned_objects: list[SpawnedObject] = []
 
+    def build(self, assets_root_path: str) -> None:
+        self.add_ground()
+        self.frankas = self.add_frankas(assets_root_path)
+        self.add_table()
+        self.add_lighting()
+        self.top_camera = self.add_top_camera()
 
-def random_horizontal_capsule_quaternion(rng: np.random.Generator) -> np.ndarray:
-    yaw = random_yaw_quaternion(rng)
-    pitch_90 = np.array([np.sqrt(0.5), 0.0, np.sqrt(0.5), 0.0])
-    return quaternion_multiply(yaw, pitch_90)
+    def initialize_sensors(self) -> None:
+        if self.top_camera is not None:
+            self.top_camera.initialize()
+            self.apply_top_camera_lens()
 
+    def add_ground(self) -> None:
+        if USE_DEFAULT_FRICTION:
+            self.world.scene.add_default_ground_plane()
+            return
+        self.world.scene.add_default_ground_plane(
+            static_friction=GROUND_STATIC_FRICTION,
+            dynamic_friction=GROUND_DYNAMIC_FRICTION,
+            restitution=0.0,
+        )
 
-def marker_orientation_from_wxyz(
-    orientation: np.ndarray,
-) -> tuple[float, float, float, float]:
-    return (
-        float(orientation[1]),
-        float(orientation[2]),
-        float(orientation[3]),
-        float(orientation[0]),
-    )
+    @property
+    def franka(self) -> Robot | None:
+        return self.frankas.get("left")
 
+    def add_frankas(self, assets_root_path: str) -> dict[str, Robot]:
+        robots: dict[str, Robot] = {}
+        for robot_id, config in ROBOT_CONFIGS.items():
+            robot_prim = add_reference_to_stage(
+                usd_path=assets_root_path + FRANKA_USD_PATH,
+                prim_path=config["prim_path"],
+            )
+            robot_prim.GetVariantSet("Gripper").SetVariantSelection("AlternateFinger")
+            robot_prim.GetVariantSet("Mesh").SetVariantSelection("Quality")
+            robots[robot_id] = self.world.scene.add(
+                Robot(
+                    prim_path=config["prim_path"],
+                    name=config["name"],
+                    position=config["position"],
+                    orientation=config["orientation"],
+                )
+            )
+            robots[robot_id].set_world_pose(
+                position=config["position"], orientation=config["orientation"]
+            )
+        return robots
 
-def table_limited_workspace(
-    footprint_radius: float,
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    table_x_min = TABLE_CENTER[0] - TABLE_DIMS[0] / 2.0 + footprint_radius
-    table_x_max = TABLE_CENTER[0] + TABLE_DIMS[0] / 2.0 - footprint_radius
-    table_y_min = TABLE_CENTER[1] - TABLE_DIMS[1] / 2.0 + footprint_radius
-    table_y_max = TABLE_CENTER[1] + TABLE_DIMS[1] / 2.0 - footprint_radius
+    def create_physics_material(
+        self, name: str, static_friction: float, dynamic_friction: float
+    ) -> PhysicsMaterial:
+        return PhysicsMaterial(
+            prim_path=f"/World/PhysicsMaterials/{name}",
+            static_friction=static_friction,
+            dynamic_friction=dynamic_friction,
+            restitution=0.0,
+        )
 
-    x_range = (
-        max(ROBOT_WORKSPACE_X_RANGE[0], table_x_min),
-        min(ROBOT_WORKSPACE_X_RANGE[1], table_x_max),
-    )
-    y_range = (
-        max(ROBOT_WORKSPACE_Y_RANGE[0], table_y_min),
-        min(ROBOT_WORKSPACE_Y_RANGE[1], table_y_max),
-    )
-    if x_range[0] >= x_range[1] or y_range[0] >= y_range[1]:
+    def table_limited_workspace(
+        self, footprint_radius: float
+    ) -> tuple[tuple[float, float], tuple[float, float]]:
+        spawn_dims = TABLE_DIMS[:2] * 0.8
+        table_x_min = TABLE_CENTER[0] - spawn_dims[0] / 2.0 + footprint_radius
+        table_x_max = TABLE_CENTER[0] + spawn_dims[0] / 2.0 - footprint_radius
+        table_y_min = TABLE_CENTER[1] - spawn_dims[1] / 2.0 + footprint_radius
+        table_y_max = TABLE_CENTER[1] + spawn_dims[1] / 2.0 - footprint_radius
+        x_range = (
+            table_x_min,
+            table_x_max,
+        )
+        y_range = (
+            table_y_min,
+            table_y_max,
+        )
+        if x_range[0] >= x_range[1] or y_range[0] >= y_range[1]:
+            raise RuntimeError(
+                "Object footprint is too large for the configured robot workspace and table bounds."
+            )
+        return x_range, y_range
+
+    def sample_non_overlapping_xy(
+        self,
+        rng: np.random.Generator,
+        footprint_radius: float,
+        occupied: list[tuple[np.ndarray, float]],
+    ) -> np.ndarray:
+        x_range, y_range = self.table_limited_workspace(footprint_radius)
+        for _ in range(MAX_SPAWN_ATTEMPTS):
+            xy = np.array([rng.uniform(*x_range), rng.uniform(*y_range)])
+            if self.overlaps_goal_zone(xy, footprint_radius):
+                continue
+            if all(
+                np.linalg.norm(xy - center)
+                >= footprint_radius + other_radius + MIN_OBJECT_CLEARANCE
+                for center, other_radius in occupied
+            ):
+                occupied.append((xy, footprint_radius))
+                return xy
         raise RuntimeError(
-            "Object footprint is too large for the configured robot workspace and table bounds."
+            "Could not sample a non-overlapping object pose. Reduce object counts or sizes."
         )
-    return x_range, y_range
 
+    def overlaps_goal_zone(self, xy: np.ndarray, footprint_radius: float) -> bool:
+        clearance = footprint_radius + MIN_OBJECT_CLEARANCE
+        for zone in GOAL_ZONES.values():
+            center = zone["center"][:2]
+            half_extents = GOAL_DIMS[:2] / 2.0 + clearance
+            if np.all(np.abs(xy - center) <= half_extents):
+                return True
+        return False
 
-def sample_non_overlapping_xy(
-    rng: np.random.Generator,
-    footprint_radius: float,
-    occupied: list[tuple[np.ndarray, float]],
-) -> np.ndarray:
-    x_range, y_range = table_limited_workspace(footprint_radius)
-    for _ in range(MAX_SPAWN_ATTEMPTS):
-        xy = np.array([rng.uniform(*x_range), rng.uniform(*y_range)])
-        if all(
-            np.linalg.norm(xy - center)
-            >= footprint_radius + other_radius + MIN_OBJECT_CLEARANCE
-            for center, other_radius in occupied
-        ):
-            occupied.append((xy, footprint_radius))
-            return xy
-    raise RuntimeError(
-        "Could not sample a non-overlapping object pose. Reduce object counts or sizes."
-    )
+    def create_spawn_specs(self, rng: np.random.Generator) -> list[SpawnSpec]:
+        specs: list[SpawnSpec] = []
 
+        def object_color() -> np.ndarray:
+            color_name = "red" if rng.random() < 0.5 else "blue"
+            return np.array(OBJECT_COLORS[color_name], dtype=np.float64)
 
-def create_physics_material(
-    name: str, static_friction: float, dynamic_friction: float
-) -> PhysicsMaterial:
-    return PhysicsMaterial(
-        prim_path=f"/World/PhysicsMaterials/{name}",
-        static_friction=static_friction,
-        dynamic_friction=dynamic_friction,
-        restitution=0.0,
-    )
+        for index in range(NUM_CUBES):
+            size = float(rng.uniform(0.045, 0.065) * OBJECT_SIZE_SCALE)
+            specs.append(
+                SpawnSpec(
+                    shape="cube",
+                    size=size,
+                    radius=0.0,
+                    height=0.0,
+                    footprint_radius=np.sqrt(2.0) * size / 2.0,
+                    color=object_color(),
+                    orientation=QuaternionUtils.random_yaw(rng),
+                    z=TABLE_TOP_Z + size / 2.0 + 0.003,
+                )
+            )
+        for index in range(NUM_CAPSULES):
+            radius = float(rng.uniform(0.020, 0.027) * OBJECT_SIZE_SCALE)
+            height = float(rng.uniform(0.055, 0.085) * OBJECT_SIZE_SCALE)
+            specs.append(
+                SpawnSpec(
+                    shape="capsule",
+                    size=0.0,
+                    radius=radius,
+                    height=height,
+                    footprint_radius=height / 2.0 + radius,
+                    color=object_color(),
+                    orientation=QuaternionUtils.random_horizontal_capsule(rng),
+                    z=TABLE_TOP_Z + radius + 0.004,
+                )
+            )
+        for index in range(NUM_SPHERES):
+            radius = float(rng.uniform(0.028, 0.04) * OBJECT_SIZE_SCALE)
+            specs.append(
+                SpawnSpec(
+                    shape="sphere",
+                    size=0.0,
+                    radius=radius,
+                    height=0.0,
+                    footprint_radius=radius,
+                    color=object_color(),
+                    orientation=QuaternionUtils.random_yaw(rng),
+                    z=TABLE_TOP_Z + radius + 0.004,
+                )
+            )
+        rng.shuffle(specs)
+        return specs
 
+    def add_table(self) -> None:
+        table_material = None
+        self.object_material = None
+        if not USE_DEFAULT_FRICTION:
+            table_material = self.create_physics_material(
+                "table_high_friction", TABLE_STATIC_FRICTION, TABLE_DYNAMIC_FRICTION
+            )
+            self.object_material = self.create_physics_material(
+                "object_high_friction", OBJECT_STATIC_FRICTION, OBJECT_DYNAMIC_FRICTION
+            )
 
-def add_franka(world: World, assets_root_path: str) -> Robot:
-    robot = add_reference_to_stage(
-        usd_path=assets_root_path + FRANKA_USD_PATH,
-        prim_path=FRANKA_PRIM_PATH,
-    )
-    robot.GetVariantSet("Gripper").SetVariantSelection("AlternateFinger")
-    robot.GetVariantSet("Mesh").SetVariantSelection("Quality")
-
-    # The Franka USD is a fixed-base articulation; keep it at the world origin facing +X.
-    return world.scene.add(
-        Robot(
-            prim_path=FRANKA_PRIM_PATH,
-            name="franka",
-            position=np.array([0.0, 0.0, 0.0]),
-        )
-    )
-
-
-def create_spawn_specs(rng: np.random.Generator) -> list[SpawnSpec]:
-    specs: list[SpawnSpec] = []
-
-    for _ in range(NUM_CUBES):
-        size = float(rng.uniform(0.045, 0.065) * OBJECT_SIZE_SCALE)
-        specs.append(
-            SpawnSpec(
-                shape="cube",
-                size=size,
-                radius=0.0,
-                height=0.0,
-                footprint_radius=np.sqrt(2.0) * size / 2.0,
-                color=np.array([0.1, 0.45, 0.95]),
-                orientation=random_yaw_quaternion(rng),
-                z=TABLE_TOP_Z + size / 2.0 + 0.003,
+        self.world.scene.add(
+            FixedCuboid(
+                prim_path="/World/Table",
+                name="table",
+                position=TABLE_CENTER,
+                scale=TABLE_DIMS,
+                size=1.0,
+                color=np.array([0.55, 0.42, 0.30]),
+                **(
+                    {}
+                    if table_material is None
+                    else {"physics_material": table_material}
+                ),
             )
         )
+        self.add_table_rims(table_material)
+        self.add_goal_zones(table_material)
 
-    for _ in range(NUM_CAPSULES):
-        radius = float(rng.uniform(0.022, 0.032) * OBJECT_SIZE_SCALE)
-        height = float(rng.uniform(0.09, 0.13) * OBJECT_SIZE_SCALE)
-        specs.append(
-            SpawnSpec(
-                shape="capsule",
-                size=0.0,
-                radius=radius,
-                height=height,
-                footprint_radius=height / 2.0 + radius,
-                color=np.array([0.95, 0.62, 0.12]),
-                orientation=random_horizontal_capsule_quaternion(rng),
-                z=TABLE_TOP_Z + radius + 0.004,
+    def add_table_rims(self, table_material: PhysicsMaterial | None) -> None:
+        material_kwargs = {} if table_material is None else {"physics_material": table_material}
+        rim_z = TABLE_TOP_Z + TABLE_RIM_HEIGHT / 2.0
+        rim_specs = [
+            (
+                "x_min",
+                np.array([TABLE_CENTER[0] - TABLE_DIMS[0] / 2.0 + TABLE_RIM_THICKNESS / 2.0, TABLE_CENTER[1], rim_z]),
+                np.array([TABLE_RIM_THICKNESS, TABLE_DIMS[1], TABLE_RIM_HEIGHT]),
+            ),
+            (
+                "x_max",
+                np.array([TABLE_CENTER[0] + TABLE_DIMS[0] / 2.0 - TABLE_RIM_THICKNESS / 2.0, TABLE_CENTER[1], rim_z]),
+                np.array([TABLE_RIM_THICKNESS, TABLE_DIMS[1], TABLE_RIM_HEIGHT]),
+            ),
+            (
+                "y_min",
+                np.array([TABLE_CENTER[0], TABLE_CENTER[1] - TABLE_DIMS[1] / 2.0 + TABLE_RIM_THICKNESS / 2.0, rim_z]),
+                np.array([TABLE_DIMS[0], TABLE_RIM_THICKNESS, TABLE_RIM_HEIGHT]),
+            ),
+            (
+                "y_max",
+                np.array([TABLE_CENTER[0], TABLE_CENTER[1] + TABLE_DIMS[1] / 2.0 - TABLE_RIM_THICKNESS / 2.0, rim_z]),
+                np.array([TABLE_DIMS[0], TABLE_RIM_THICKNESS, TABLE_RIM_HEIGHT]),
+            ),
+        ]
+        for suffix, position, scale in rim_specs:
+            self.world.scene.add(
+                FixedCuboid(
+                    prim_path=f"/World/TableRims/{suffix}",
+                    name=f"table_rim_{suffix}",
+                    position=position,
+                    scale=scale,
+                    size=1.0,
+                    color=TABLE_RIM_COLOR,
+                    **material_kwargs,
+                )
+            )
+
+    def add_goal_zones(self, table_material: PhysicsMaterial | None) -> None:
+        material_kwargs = {} if table_material is None else {"physics_material": table_material}
+        for robot_id, zone in GOAL_ZONES.items():
+            center = zone["center"]
+            name = zone["name"]
+            color = zone["color"]
+            self.world.scene.add(
+                FixedCuboid(
+                    prim_path=f"/World/GoalZones/{name}",
+                    name=name,
+                    position=center,
+                    scale=GOAL_DIMS,
+                    size=1.0,
+                    color=color,
+                    **material_kwargs,
+                )
+            )
+            self.add_goal_rims(robot_id, name, center, table_material)
+
+    def add_goal_rims(
+        self,
+        robot_id: str,
+        goal_name: str,
+        goal_center: np.ndarray,
+        table_material: PhysicsMaterial | None,
+    ) -> None:
+        material_kwargs = {} if table_material is None else {"physics_material": table_material}
+        rim_z = TABLE_TOP_Z + GOAL_RIM_HEIGHT / 2.0 + GOAL_DIMS[2]
+        rim_specs = [
+            (
+                "left",
+                np.array([goal_center[0] - GOAL_DIMS[0] / 2.0 + GOAL_RIM_THICKNESS / 2.0, goal_center[1], rim_z]),
+                np.array([GOAL_RIM_THICKNESS, GOAL_DIMS[1], GOAL_RIM_HEIGHT]),
+            ),
+            (
+                "right",
+                np.array([goal_center[0] + GOAL_DIMS[0] / 2.0 - GOAL_RIM_THICKNESS / 2.0, goal_center[1], rim_z]),
+                np.array([GOAL_RIM_THICKNESS, GOAL_DIMS[1], GOAL_RIM_HEIGHT]),
+            ),
+            (
+                "front",
+                np.array([goal_center[0], goal_center[1] - GOAL_DIMS[1] / 2.0 + GOAL_RIM_THICKNESS / 2.0, rim_z]),
+                np.array([GOAL_DIMS[0], GOAL_RIM_THICKNESS, GOAL_RIM_HEIGHT]),
+            ),
+            (
+                "back",
+                np.array([goal_center[0], goal_center[1] + GOAL_DIMS[1] / 2.0 - GOAL_RIM_THICKNESS / 2.0, rim_z]),
+                np.array([GOAL_DIMS[0], GOAL_RIM_THICKNESS, GOAL_RIM_HEIGHT]),
+            ),
+        ]
+        for suffix, position, scale in rim_specs:
+            self.world.scene.add(
+                FixedCuboid(
+                    prim_path=f"/World/GoalZoneRims/{goal_name}_{suffix}",
+                    name=f"{robot_id}_goal_rim_{suffix}",
+                    position=position,
+                    scale=scale,
+                    size=1.0,
+                    color=TABLE_RIM_COLOR,
+                    **material_kwargs,
+                )
+            )
+
+    def spawn_objects(self) -> None:
+        if self.spawned_objects:
+            return
+
+        rng = np.random.default_rng(self.seed)
+        spawned_objects: list[SpawnedObject] = []
+        occupied: list[tuple[np.ndarray, float]] = []
+        shape_counts = {"cube": 0, "capsule": 0, "sphere": 0}
+        for spec in self.create_spawn_specs(rng):
+            shape_counts[spec.shape] += 1
+            object_index = shape_counts[spec.shape]
+            xy = self.sample_non_overlapping_xy(rng, spec.footprint_radius, occupied)
+            position = np.array([xy[0], xy[1], spec.z])
+            prim, marker_scale = self.add_object_from_spec(
+                spec, object_index, position, self.object_material
+            )
+            spawned_objects.append(
+                SpawnedObject(
+                    name=f"{spec.shape}_{object_index}",
+                    shape=spec.shape,
+                    prim=prim,
+                    color=spec.color,
+                    marker_scale=marker_scale,
+                )
+            )
+        self.spawned_objects.extend(spawned_objects)
+        carb.log_info(
+            f"Spawned {len(spawned_objects)} table objects after robot settling delay."
+        )
+
+    def add_lighting(self) -> None:
+        stage = get_current_stage()
+
+        softbox = UsdLux.RectLight.Define(stage, Sdf.Path("/World/TopCameraSoftbox"))
+        softbox.CreateIntensityAttr(900.0)
+        softbox.CreateWidthAttr(1.25)
+        softbox.CreateHeightAttr(1.0)
+        softbox.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+        UsdGeom.Xformable(softbox.GetPrim()).AddTranslateOp().Set(
+            Gf.Vec3d(TOP_CAMERA_POSITION[0], TOP_CAMERA_POSITION[1], 1.08)
+        )
+
+        fill = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/ColorFillDomeLight"))
+        fill.CreateIntensityAttr(350.0)
+        fill.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+
+    def add_top_camera(self) -> Camera:
+        camera = self.world.scene.add(
+            Camera(
+                prim_path=TOP_CAMERA_PRIM_PATH,
+                name="top_camera",
+                frequency=int(RGB_CAMERA_PUBLISH_HZ),
+                resolution=RGB_CAMERA_RESOLUTION,
+                position=np.array(TOP_CAMERA_POSITION, dtype=np.float64),
+                orientation=euler_angles_to_quats(
+                    np.array(TOP_CAMERA_EULER_DEGREES), degrees=True
+                ),
             )
         )
+        self.apply_top_camera_lens()
+        return camera
 
-    for _ in range(NUM_SPHERES):
-        radius = float(rng.uniform(0.028, 0.04) * OBJECT_SIZE_SCALE)
-        specs.append(
-            SpawnSpec(
-                shape="sphere",
-                size=0.0,
-                radius=radius,
-                height=0.0,
-                footprint_radius=radius,
-                color=np.array([0.12, 0.75, 0.35]),
-                orientation=random_yaw_quaternion(rng),
-                z=TABLE_TOP_Z + radius + 0.004,
+    def apply_top_camera_lens(self) -> None:
+        stage = get_current_stage()
+        prim = stage.GetPrimAtPath(TOP_CAMERA_PRIM_PATH)
+        if not prim.IsValid():
+            carb.log_warn(f"Top camera prim not found: {TOP_CAMERA_PRIM_PATH}")
+            return
+
+        focal_attr = prim.GetAttribute("focalLength")
+        if not focal_attr.IsValid():
+            focal_attr = prim.CreateAttribute(
+                "focalLength", Sdf.ValueTypeNames.Float, False
             )
+        focal_attr.Set(float(TOP_CAMERA_FOCAL_LENGTH))
+
+        clipping_attr = prim.GetAttribute("clippingRange")
+        if clipping_attr.IsValid():
+            clipping_attr.Set(Gf.Vec2f(0.01, 5.0))
+
+        carb.log_info(
+            f"Set {TOP_CAMERA_PRIM_PATH}.focalLength to {TOP_CAMERA_FOCAL_LENGTH}"
         )
 
-    rng.shuffle(specs)
-    return specs
-
-
-def add_table_and_objects(world: World, seed: int | None) -> list[SpawnedObject]:
-    rng = np.random.default_rng(seed)
-    table_material = None
-    object_material = None
-    if not USE_DEFAULT_FRICTION:
-        table_material = create_physics_material(
-            "table_high_friction", TABLE_STATIC_FRICTION, TABLE_DYNAMIC_FRICTION
+    def add_object_from_spec(
+        self,
+        spec: SpawnSpec,
+        object_index: int,
+        position: np.ndarray,
+        object_material: PhysicsMaterial | None,
+    ) -> tuple[object, np.ndarray]:
+        material_kwargs = (
+            {} if object_material is None else {"physics_material": object_material}
         )
-        object_material = create_physics_material(
-            "object_high_friction", OBJECT_STATIC_FRICTION, OBJECT_DYNAMIC_FRICTION
-        )
-
-    world.scene.add(
-        FixedCuboid(
-            prim_path="/World/Table",
-            name="table",
-            position=TABLE_CENTER,
-            scale=TABLE_DIMS,
-            size=1.0,
-            color=np.array([0.55, 0.42, 0.30]),
-            **({} if table_material is None else {"physics_material": table_material}),
-        )
-    )
-
-    spawned_objects: list[SpawnedObject] = []
-    occupied: list[tuple[np.ndarray, float]] = []
-    shape_counts = {"cube": 0, "capsule": 0, "sphere": 0}
-
-    for spec in create_spawn_specs(rng):
-        shape_counts[spec.shape] += 1
-        object_index = shape_counts[spec.shape]
-        xy = sample_non_overlapping_xy(rng, spec.footprint_radius, occupied)
-        position = np.array([xy[0], xy[1], spec.z])
-
         if spec.shape == "cube":
-            prim = world.scene.add(
+            prim = self.world.scene.add(
                 DynamicCuboid(
                     prim_path=f"/World/Objects/Cube_{object_index}",
                     name=f"cube_{object_index}",
@@ -371,17 +726,14 @@ def add_table_and_objects(world: World, seed: int | None) -> list[SpawnedObject]
                     scale=np.array([spec.size, spec.size, spec.size]),
                     size=1.0,
                     color=spec.color,
-                    **(
-                        {}
-                        if object_material is None
-                        else {"physics_material": object_material}
-                    ),
+                    **material_kwargs,
                     mass=0.05,
                 )
             )
-            marker_scale = np.array([spec.size, spec.size, spec.size])
-        elif spec.shape == "capsule":
-            prim = world.scene.add(
+            self.apply_object_damping(prim)
+            return prim, np.array([spec.size, spec.size, spec.size])
+        if spec.shape == "capsule":
+            prim = self.world.scene.add(
                 DynamicCapsule(
                     prim_path=f"/World/Objects/Capsule_{object_index}",
                     name=f"capsule_{object_index}",
@@ -390,47 +742,34 @@ def add_table_and_objects(world: World, seed: int | None) -> list[SpawnedObject]
                     radius=spec.radius,
                     height=spec.height,
                     color=spec.color,
-                    **(
-                        {}
-                        if object_material is None
-                        else {"physics_material": object_material}
-                    ),
+                    **material_kwargs,
                     mass=0.04,
                 )
             )
-            marker_scale = np.array([2.0 * spec.radius, 2.0 * spec.radius, spec.height])
-        else:
-            prim = world.scene.add(
-                DynamicSphere(
-                    prim_path=f"/World/Objects/Sphere_{object_index}",
-                    name=f"sphere_{object_index}",
-                    position=position,
-                    orientation=spec.orientation,
-                    radius=spec.radius,
-                    color=spec.color,
-                    **(
-                        {}
-                        if object_material is None
-                        else {"physics_material": object_material}
-                    ),
-                    mass=0.04,
-                )
-            )
-            marker_scale = np.array(
-                [2.0 * spec.radius, 2.0 * spec.radius, 2.0 * spec.radius]
-            )
-
-        spawned_objects.append(
-            SpawnedObject(
-                name=f"{spec.shape}_{object_index}",
-                shape=spec.shape,
-                prim=prim,
+            self.apply_object_damping(prim)
+            return prim, np.array([2.0 * spec.radius, 2.0 * spec.radius, spec.height])
+        prim = self.world.scene.add(
+            DynamicSphere(
+                prim_path=f"/World/Objects/Sphere_{object_index}",
+                name=f"sphere_{object_index}",
+                position=position,
+                orientation=spec.orientation,
+                radius=spec.radius,
                 color=spec.color,
-                marker_scale=marker_scale,
+                **material_kwargs,
+                mass=0.04,
             )
         )
+        self.apply_object_damping(prim)
+        return prim, np.array([2.0 * spec.radius, 2.0 * spec.radius, 2.0 * spec.radius])
 
-    return spawned_objects
+    def apply_object_damping(self, dynamic_prim: object) -> None:
+        rigid_prim = dynamic_prim.prim
+        if rigid_prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+            rigid_body_api = PhysxSchema.PhysxRigidBodyAPI(rigid_prim)
+        else:
+            rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(rigid_prim)
+        rigid_body_api.CreateLinearDampingAttr().Set(float(OBJECT_LINEAR_DAMPING))
 
 
 class CdrWriter:
@@ -445,6 +784,9 @@ class CdrWriter:
 
     def write_bool(self, value: bool) -> None:
         self.buffer.extend(struct.pack("<?", value))
+
+    def write_uint8(self, value: int) -> None:
+        self.buffer.extend(struct.pack("<B", value))
 
     def write_int32(self, value: int) -> None:
         self.align(4)
@@ -565,156 +907,275 @@ class CdrReader:
         return values
 
 
-def deserialize_joint_state(data: bytes) -> JointStateCommand:
-    reader = CdrReader(data)
-    reader.read_int32()
-    reader.read_uint32()
-    reader.read_string()
-    names = reader.read_string_sequence()
-    positions = reader.read_float64_sequence()
-    velocities = reader.read_float64_sequence()
-    efforts = reader.read_float64_sequence()
-    return JointStateCommand(names, positions, velocities, efforts)
+class RosMessageCodec:
+    @staticmethod
+    def deserialize_joint_state(data: bytes) -> JointStateCommand:
+        reader = CdrReader(data)
+        reader.read_int32()
+        reader.read_uint32()
+        reader.read_string()
+        names = reader.read_string_sequence()
+        positions = reader.read_float64_sequence()
+        velocities = reader.read_float64_sequence()
+        efforts = reader.read_float64_sequence()
+        return JointStateCommand(names, positions, velocities, efforts)
+
+    @staticmethod
+    def deserialize_control_command_request(data: bytes) -> ControlCommandRequest:
+        reader = CdrReader(data)
+        action = reader.read_string()
+        position = np.array(
+            [reader.read_float64(), reader.read_float64(), reader.read_float64()],
+            dtype=np.float64,
+        )
+        orientation_xyzw = np.array(
+            [
+                reader.read_float64(),
+                reader.read_float64(),
+                reader.read_float64(),
+                reader.read_float64(),
+            ],
+            dtype=np.float64,
+        )
+        return ControlCommandRequest(action, PoseCommand(position, orientation_xyzw))
+
+    @staticmethod
+    def serialize_control_command_response(response: ControlCommandResponse) -> bytes:
+        writer = CdrWriter()
+        writer.write_bool(response.success)
+        writer.write_string(response.message)
+        return writer.to_bytes()
+
+    @staticmethod
+    def serialize_joint_state(
+        names: list[str],
+        positions: list[float],
+        velocities: list[float],
+        efforts: list[float],
+        frame_id: str,
+    ) -> bytes:
+        now = time.time()
+        sec = int(now)
+        nanosec = int((now - sec) * 1_000_000_000)
+        writer = CdrWriter()
+        writer.write_header(sec, nanosec, frame_id)
+        writer.write_string_sequence(names)
+        writer.write_float64_sequence(positions)
+        writer.write_float64_sequence(velocities)
+        writer.write_float64_sequence(efforts)
+        return writer.to_bytes()
+
+    @staticmethod
+    def serialize_pose(position: np.ndarray, orientation_wxyz: np.ndarray) -> bytes:
+        qx, qy, qz, qw = QuaternionUtils.wxyz_to_xyzw(orientation_wxyz)
+        writer = CdrWriter()
+        writer.write_float64(float(position[0]))
+        writer.write_float64(float(position[1]))
+        writer.write_float64(float(position[2]))
+        writer.write_float64(qx)
+        writer.write_float64(qy)
+        writer.write_float64(qz)
+        writer.write_float64(qw)
+        return writer.to_bytes()
+
+    @staticmethod
+    def serialize_rgb_image(image: np.ndarray, frame_id: str) -> bytes:
+        rgb = np.asarray(image)
+        if rgb.ndim != 3 or rgb.shape[2] < 3:
+            raise ValueError(f"Expected RGB image with shape HxWx3+, got {rgb.shape}.")
+        rgb = rgb[:, :, :3]
+        if rgb.dtype != np.uint8:
+            rgb = rgb.astype(np.float32)
+            if rgb.size > 0 and float(np.nanmax(rgb)) <= 1.0:
+                rgb *= 255.0
+            rgb = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+        rgb = np.ascontiguousarray(rgb)
+
+        height, width = rgb.shape[:2]
+        now = time.time()
+        sec = int(now)
+        nanosec = int((now - sec) * 1_000_000_000)
+        writer = CdrWriter()
+        writer.write_header(sec, nanosec, frame_id)
+        writer.write_uint32(int(height))
+        writer.write_uint32(int(width))
+        writer.write_string("rgb8")
+        writer.write_uint8(0)
+        writer.write_uint32(int(width * 3))
+        writer.write_uint8_sequence(rgb.tobytes())
+        return writer.to_bytes()
 
 
-def deserialize_control_command_request(data: bytes) -> ControlCommandRequest:
-    reader = CdrReader(data)
-    action = reader.read_string()
-    position = np.array(
-        [reader.read_float64(), reader.read_float64(), reader.read_float64()],
-        dtype=np.float64,
-    )
-    orientation_xyzw = np.array(
-        [
-            reader.read_float64(),
-            reader.read_float64(),
-            reader.read_float64(),
-            reader.read_float64(),
-        ],
-        dtype=np.float64,
-    )
-    return ControlCommandRequest(action, PoseCommand(position, orientation_xyzw))
+class MarkerArrayCodec:
+    @staticmethod
+    def serialize(objects: list[SpawnedObject], frame_id: str) -> bytes:
+        writer = CdrWriter()
+        fixed_marker_count = 1 + len(GOAL_ZONES)
+        writer.write_uint32(len(objects) + fixed_marker_count)
+        MarkerArrayCodec.write_table_marker(writer, frame_id)
+        MarkerArrayCodec.write_goal_markers(writer, frame_id)
+        for marker_id, spawned_object in enumerate(objects):
+            MarkerArrayCodec.write_marker(
+                writer, marker_id + fixed_marker_count, frame_id, spawned_object
+            )
+        return writer.to_bytes()
+
+    @staticmethod
+    def write_table_marker(writer: CdrWriter, frame_id: str) -> None:
+        MarkerArrayCodec.write_marker_fields(
+            writer=writer,
+            frame_id=frame_id,
+            namespace="table",
+            marker_id=0,
+            marker_type=1,
+            position=TABLE_CENTER,
+            orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+            scale=TABLE_DIMS,
+            color=np.array([0.55, 0.42, 0.30]),
+            alpha=0.45,
+        )
+
+    @staticmethod
+    def write_goal_markers(writer: CdrWriter, frame_id: str) -> None:
+        for marker_id, zone in enumerate(GOAL_ZONES.values(), start=1):
+            MarkerArrayCodec.write_marker_fields(
+                writer=writer,
+                frame_id=frame_id,
+                namespace=zone["name"],
+                marker_id=marker_id,
+                marker_type=1,
+                position=zone["center"],
+                orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                scale=GOAL_DIMS,
+                color=zone["color"],
+                alpha=0.65,
+            )
+
+    @staticmethod
+    def write_marker(
+        writer: CdrWriter, marker_id: int, frame_id: str, spawned_object: SpawnedObject
+    ) -> None:
+        position, orientation = spawned_object.prim.get_world_pose()
+        qx, qy, qz, qw = QuaternionUtils.wxyz_to_xyzw(orientation)
+        marker_type = 1 if spawned_object.shape == "cube" else 2
+        MarkerArrayCodec.write_marker_fields(
+            writer=writer,
+            frame_id=frame_id,
+            namespace=spawned_object.name,
+            marker_id=marker_id,
+            marker_type=marker_type,
+            position=position,
+            orientation_xyzw=(qx, qy, qz, qw),
+            scale=spawned_object.marker_scale,
+            color=spawned_object.color,
+            alpha=0.9,
+        )
+
+    @staticmethod
+    def write_marker_fields(
+        writer: CdrWriter,
+        frame_id: str,
+        namespace: str,
+        marker_id: int,
+        marker_type: int,
+        position: np.ndarray,
+        orientation_xyzw: tuple[float, float, float, float],
+        scale: np.ndarray,
+        color: np.ndarray,
+        alpha: float,
+    ) -> None:
+        now = time.time()
+        sec = int(now)
+        nanosec = int((now - sec) * 1_000_000_000)
+        qx, qy, qz, qw = orientation_xyzw
+        writer.write_header(sec, nanosec, frame_id)
+        writer.write_string(namespace)
+        writer.write_int32(marker_id)
+        writer.write_int32(marker_type)
+        writer.write_int32(0)
+        writer.write_float64(float(position[0]))
+        writer.write_float64(float(position[1]))
+        writer.write_float64(float(position[2]))
+        writer.write_float64(qx)
+        writer.write_float64(qy)
+        writer.write_float64(qz)
+        writer.write_float64(qw)
+        writer.write_vector3(scale)
+        writer.write_color(color, alpha)
+        writer.write_int32(0)
+        writer.write_uint32(0)
+        writer.write_bool(False)
+        writer.write_uint32(0)
+        writer.write_uint32(0)
+        writer.write_string("")
+        writer.write_header(0, 0, "")
+        writer.write_string("")
+        writer.write_uint8_sequence()
+        writer.write_uint32(0)
+        writer.write_string("")
+        writer.write_string("")
+        writer.write_string("")
+        writer.write_uint8_sequence()
+        writer.write_bool(False)
 
 
-def serialize_control_command_response(response: ControlCommandResponse) -> bytes:
-    writer = CdrWriter()
-    writer.write_bool(response.success)
-    writer.write_string(response.message)
-    return writer.to_bytes()
-
-
-def serialize_joint_state(
-    names: list[str],
-    positions: list[float],
-    velocities: list[float],
-    efforts: list[float],
-    frame_id: str,
-) -> bytes:
-    now = time.time()
-    sec = int(now)
-    nanosec = int((now - sec) * 1_000_000_000)
-    writer = CdrWriter()
-    writer.write_header(sec, nanosec, frame_id)
-    writer.write_string_sequence(names)
-    writer.write_float64_sequence(positions)
-    writer.write_float64_sequence(velocities)
-    writer.write_float64_sequence(efforts)
-    return writer.to_bytes()
-
-
-def quaternion_xyzw_to_wxyz(quaternion: np.ndarray) -> np.ndarray | None:
-    norm = float(np.linalg.norm(quaternion))
-    if norm < 1.0e-6:
-        return None
-    x, y, z, w = quaternion / norm
-    return np.array([w, x, y, z], dtype=np.float64)
-
-
-def quaternion_angular_distance_wxyz(left: np.ndarray, right: np.ndarray) -> float:
-    left_norm = left / max(float(np.linalg.norm(left)), 1.0e-9)
-    right_norm = right / max(float(np.linalg.norm(right)), 1.0e-9)
-    dot = float(np.clip(abs(np.dot(left_norm, right_norm)), -1.0, 1.0))
-    return 2.0 * float(np.arccos(dot))
-
-
-def write_marker(
-    writer: CdrWriter, marker_id: int, frame_id: str, spawned_object: SpawnedObject
-) -> None:
-    now = time.time()
-    sec = int(now)
-    nanosec = int((now - sec) * 1_000_000_000)
-    position, orientation = spawned_object.prim.get_world_pose()
-    qx, qy, qz, qw = marker_orientation_from_wxyz(orientation)
-    marker_type = 1 if spawned_object.shape == "cube" else 2
-
-    writer.write_header(sec, nanosec, frame_id)
-    writer.write_string(spawned_object.name)
-    writer.write_int32(marker_id)
-    writer.write_int32(marker_type)
-    writer.write_int32(0)
-    writer.write_float64(float(position[0]))
-    writer.write_float64(float(position[1]))
-    writer.write_float64(float(position[2]))
-    writer.write_float64(qx)
-    writer.write_float64(qy)
-    writer.write_float64(qz)
-    writer.write_float64(qw)
-    writer.write_vector3(spawned_object.marker_scale)
-    writer.write_color(spawned_object.color, 0.9)
-    writer.write_int32(0)
-    writer.write_uint32(0)
-    writer.write_bool(False)
-    writer.write_uint32(0)
-    writer.write_uint32(0)
-    writer.write_string("")
-    writer.write_header(0, 0, "")
-    writer.write_string("")
-    writer.write_uint8_sequence()
-    writer.write_uint32(0)
-    writer.write_string("")
-    writer.write_string("")
-    writer.write_string("")
-    writer.write_uint8_sequence()
-    writer.write_bool(False)
-
-
-def serialize_marker_array(objects: list[SpawnedObject], frame_id: str) -> bytes:
-    writer = CdrWriter()
-    writer.write_uint32(len(objects))
-    for marker_id, spawned_object in enumerate(objects):
-        write_marker(writer, marker_id, frame_id, spawned_object)
-    return writer.to_bytes()
-
-
-class RosTcpEndpointClient:
+class RosTcpClientBase:
     def __init__(
         self,
         host: str,
         port: int,
         control_mode: str,
-        joint_topic: str,
+        joint_topics: dict[str, str],
+        robot_pose_topics: dict[str, str],
         marker_topic: str,
+        image_topic: str,
+        camera_pose_topic: str,
         frame_id: str,
         publish_hz: float,
+        image_publish_hz: float,
         joint_state_publish_hz: float,
-        control_service_topic: str,
+        control_service_topics: dict[str, str],
         control_service_type: str,
         objects: list[SpawnedObject],
     ) -> None:
         self.host = host
         self.port = port
         self.control_mode = control_mode.lower()
-        self.joint_topic = normalize_ros_topic(joint_topic)
-        self.marker_topic = normalize_ros_topic(marker_topic)
-        self.control_service_topic = normalize_ros_topic(control_service_topic)
+        self.joint_topics = {
+            robot_id: RosTopic.normalize(topic)
+            for robot_id, topic in joint_topics.items()
+        }
+        self.robot_pose_topics = {
+            robot_id: RosTopic.normalize(topic)
+            for robot_id, topic in robot_pose_topics.items()
+        }
+        self.joint_topic = next(iter(self.joint_topics.values()))
+        self.marker_topic = RosTopic.normalize(marker_topic)
+        self.image_topic = RosTopic.normalize(image_topic)
+        self.camera_pose_topic = RosTopic.normalize(camera_pose_topic)
+        self.control_service_topics = {
+            robot_id: RosTopic.normalize(topic)
+            for robot_id, topic in control_service_topics.items()
+        }
+        self.control_service_topic_to_robot = {
+            topic: robot_id for robot_id, topic in self.control_service_topics.items()
+        }
         self.control_service_type = control_service_type
         self.objects = objects
         self.frame_id = frame_id
         self.publish_period = 1.0 / max(publish_hz, 0.1)
+        self.image_publish_period = 1.0 / max(image_publish_hz, 0.1)
         self.joint_state_publish_period = 1.0 / max(joint_state_publish_hz, 0.1)
         self.last_publish_time = 0.0
-        self.last_joint_state_publish_time = 0.0
+        self.last_image_publish_time = 0.0
+        self.last_pose_publish_time = 0.0
+        self.last_joint_state_publish_times = {
+            robot_id: 0.0 for robot_id in self.joint_topics
+        }
         self.socket: socket.socket | None = None
+        self.connected = False
+        self.connecting = False
+        self.next_reconnect_time = 0.0
         self.send_lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.service_lock = threading.Lock()
@@ -724,10 +1185,11 @@ class RosTcpEndpointClient:
         self.pending_service_request_id: int | None = None
         self.pending_service_requests: list[PendingServiceRequest] = []
         self.logged_first_publish = False
+        self.logged_first_camera_image = False
         self.logged_first_joint_state = False
         self.logged_first_joint_state_publish = False
         self.logged_disconnect = False
-        self.connect()
+        self.try_connect(force=True)
 
     @staticmethod
     def pack_packet(destination: str, payload: bytes) -> bytes:
@@ -742,7 +1204,7 @@ class RosTcpEndpointClient:
     @staticmethod
     def pack_syscommand(command: str, params: dict) -> bytes:
         payload = json.dumps(params).encode("utf-8") + b"\x00"
-        return RosTcpEndpointClient.pack_packet(command, payload)
+        return RosTcpClientBase.pack_packet(command, payload)
 
     @staticmethod
     def recvall(sock: socket.socket, size: int) -> bytes:
@@ -756,52 +1218,96 @@ class RosTcpEndpointClient:
             pos += count
         return bytes(data)
 
-    def connect(self) -> None:
-        self.socket = socket.create_connection((self.host, self.port), timeout=5.0)
-        self.socket.settimeout(None)
-        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    def try_connect(self, force: bool = False) -> bool:
+        if self.stop_event.is_set():
+            return False
+        if self.connected and self.socket is not None:
+            return True
 
-        self.reader_thread = threading.Thread(target=self.reader_loop, daemon=True)
-        self.reader_thread.start()
+        now = time.monotonic()
+        if not force and now < self.next_reconnect_time:
+            return False
+        if self.connecting:
+            return False
 
-        if self.control_mode == "manual":
-            self.send_syscommand(
-                "__subscribe",
-                {"topic": self.joint_topic, "message_name": "sensor_msgs/JointState"},
-            )
-        elif self.control_mode == "auto":
+        self.connecting = True
+        self.next_reconnect_time = now + ROS_TCP_RECONNECT_PERIOD_SEC
+        try:
+            sock = socket.create_connection((self.host, self.port), timeout=1.0)
+            sock.settimeout(None)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            self.socket = sock
+            self.connected = True
+            self.logged_disconnect = False
+            self.pending_service_request_id = None
+
+            self.register_ros_interfaces()
             self.send_syscommand(
                 "__publish",
                 {
-                    "topic": self.joint_topic,
-                    "message_name": "sensor_msgs/JointState",
+                    "topic": self.marker_topic,
+                    "message_name": "visualization_msgs/MarkerArray",
                     "queue_size": 10,
                     "latch": False,
                 },
             )
             self.send_syscommand(
-                "__unity_service",
+                "__publish",
                 {
-                    "topic": self.control_service_topic,
-                    "message_name": self.control_service_type,
+                    "topic": self.image_topic,
+                    "message_name": "sensor_msgs/Image",
+                    "queue_size": 2,
+                    "latch": False,
                 },
             )
-        else:
-            raise ValueError(f"Unsupported CONTROL_MODE: {self.control_mode}")
+            for pose_topic in self.robot_pose_topics.values():
+                self.register_pose_publisher(pose_topic)
+            self.register_pose_publisher(self.camera_pose_topic)
+            if not self.connected or self.socket is not sock:
+                raise ConnectionError(
+                    "ROS-TCP-Endpoint disconnected during registration."
+                )
 
-        self.send_syscommand(
-            "__publish",
-            {
-                "topic": self.marker_topic,
-                "message_name": "visualization_msgs/MarkerArray",
-                "queue_size": 10,
-                "latch": False,
-            },
-        )
-        carb.log_info(
-            f"Connected to ROS-TCP-Endpoint at {self.host}:{self.port}; "
-            f"mode={self.control_mode}, joint_topic={self.joint_topic}, marker_topic={self.marker_topic}"
-        )
+            self.reader_thread = threading.Thread(target=self.reader_loop, daemon=True)
+            self.reader_thread.start()
+
+            carb.log_info(
+                f"Connected to ROS-TCP-Endpoint at {self.host}:{self.port}; "
+                f"mode={self.control_mode}, joint_topics={self.joint_topics}, "
+                f"marker_topic={self.marker_topic}, image_topic={self.image_topic}"
+            )
+            return True
+        except Exception as exc:
+            self.close_socket()
+            carb.log_warn(
+                f"ROS-TCP-Endpoint unavailable at {self.host}:{self.port}: {exc}. "
+                f"Retrying every {ROS_TCP_RECONNECT_PERIOD_SEC:.1f}s."
+            )
+            return False
+        finally:
+            self.connecting = False
+
+    def mark_disconnected(self) -> None:
+        self.connected = False
+        self.pending_service_request_id = None
+        self.close_socket()
+        self.next_reconnect_time = time.monotonic() + ROS_TCP_RECONNECT_PERIOD_SEC
+
+    def close_socket(self) -> None:
+        sock = self.socket
+        self.socket = None
+        self.connected = False
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
 
     def send_syscommand(self, command: str, params: dict) -> None:
         self.send_raw(self.pack_syscommand(command, params))
@@ -809,44 +1315,57 @@ class RosTcpEndpointClient:
     def send_packet(self, destination: str, payload: bytes) -> None:
         self.send_raw(self.pack_packet(destination, payload))
 
+    def register_pose_publisher(self, topic: str) -> None:
+        self.send_syscommand(
+            "__publish",
+            {
+                "topic": topic,
+                "message_name": "geometry_msgs/Pose",
+                "queue_size": 10,
+                "latch": False,
+            },
+        )
+
     def send_raw(self, packet: bytes) -> None:
-        if self.socket is None:
+        if self.socket is None and not self.try_connect():
             return
         with self.send_lock:
-            self.socket.sendall(packet)
+            if self.socket is None:
+                return
+            try:
+                self.socket.sendall(packet)
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    carb.log_error(f"ROS-TCP-Endpoint send failed: {exc}")
+                    self.mark_disconnected()
 
     def reader_loop(self) -> None:
-        assert self.socket is not None
+        sock = self.socket
+        if sock is None:
+            return
         try:
             while not self.stop_event.is_set():
-                destination_length = struct.unpack("<I", self.recvall(self.socket, 4))[
-                    0
-                ]
+                destination_length = struct.unpack("<I", self.recvall(sock, 4))[0]
                 destination = (
-                    self.recvall(self.socket, destination_length)
+                    self.recvall(sock, destination_length)
                     .decode("utf-8")
                     .rstrip("\x00")
                 )
-                payload_length = struct.unpack("<I", self.recvall(self.socket, 4))[0]
-                payload = self.recvall(self.socket, payload_length)
+                payload_length = struct.unpack("<I", self.recvall(sock, 4))[0]
+                payload = self.recvall(sock, payload_length)
 
                 if self.pending_service_request_id is not None:
                     self.handle_service_payload(destination, payload)
-                elif destination == self.joint_topic and self.control_mode == "manual":
-                    command = deserialize_joint_state(payload)
-                    with self.state_lock:
-                        self.latest_joint_state = command
-                    if not self.logged_first_joint_state:
-                        carb.log_info(
-                            f"Received first JointState from ROS-TCP-Endpoint on {self.joint_topic}"
-                        )
-                        self.logged_first_joint_state = True
                 elif destination.startswith("__"):
                     self.log_syscommand(destination, payload)
+                else:
+                    self.handle_topic_message(destination, payload)
         except Exception as exc:
             if not self.stop_event.is_set() and not self.logged_disconnect:
                 carb.log_error(f"ROS-TCP-Endpoint reader stopped: {exc}")
                 self.logged_disconnect = True
+            if not self.stop_event.is_set() and self.socket is sock:
+                self.mark_disconnected()
 
     def log_syscommand(self, command: str, payload: bytes) -> None:
         try:
@@ -872,6 +1391,8 @@ class RosTcpEndpointClient:
             self.pending_service_request_id = int(data.get("srv_id", -1))
 
     def publish_if_due(self) -> None:
+        if not self.try_connect():
+            return
         now = time.monotonic()
         if now - self.last_publish_time < self.publish_period:
             return
@@ -879,7 +1400,7 @@ class RosTcpEndpointClient:
         self.publish()
 
     def publish(self) -> None:
-        payload = serialize_marker_array(self.objects, self.frame_id)
+        payload = MarkerArrayCodec.serialize(self.objects, self.frame_id)
         self.send_packet(self.marker_topic, payload)
         if not self.logged_first_publish:
             carb.log_info(
@@ -887,33 +1408,63 @@ class RosTcpEndpointClient:
             )
             self.logged_first_publish = True
 
-    def publish_joint_state_if_due(self, robot: Robot) -> None:
-        if self.control_mode != "auto":
+    def publish_camera_if_due(self, camera: Camera | None) -> None:
+        if camera is None or not self.try_connect():
             return
         now = time.monotonic()
-        if now - self.last_joint_state_publish_time < self.joint_state_publish_period:
+        if now - self.last_image_publish_time < self.image_publish_period:
             return
-        self.last_joint_state_publish_time = now
+        self.last_image_publish_time = now
 
-        positions = robot.get_joint_positions()
-        velocities = robot.get_joint_velocities()
-        if positions is None:
+        try:
+            image = camera.get_rgb()
+            if image is None:
+                return
+            payload = RosMessageCodec.serialize_rgb_image(image, self.frame_id)
+        except Exception as exc:
+            carb.log_warn(f"Skipping top camera publish: {exc}")
             return
-        if velocities is None:
-            velocities = []
-        payload = serialize_joint_state(
-            list(robot.dof_names),
-            [float(value) for value in positions],
-            [float(value) for value in velocities],
-            [],
-            self.frame_id,
-        )
-        self.send_packet(self.joint_topic, payload)
-        if not self.logged_first_joint_state_publish:
+
+        self.send_packet(self.image_topic, payload)
+        if not self.logged_first_camera_image:
+            height, width = np.asarray(image).shape[:2]
             carb.log_info(
-                f"Published first JointState through ROS-TCP-Endpoint on {self.joint_topic}"
+                f"Published first top camera RGB image {width}x{height} on {self.image_topic}"
             )
-            self.logged_first_joint_state_publish = True
+            self.logged_first_camera_image = True
+
+    def publish_pose_if_due(
+        self, robots: dict[str, Robot], camera: Camera | None
+    ) -> None:
+        if not self.try_connect():
+            return
+        now = time.monotonic()
+        if now - self.last_pose_publish_time < self.publish_period:
+            return
+        self.last_pose_publish_time = now
+
+        for robot_id, robot in robots.items():
+            topic = self.robot_pose_topics.get(robot_id)
+            if topic is None:
+                continue
+            position, orientation = robot.get_world_pose()
+            payload = RosMessageCodec.serialize_pose(
+                np.array(position, dtype=np.float64),
+                np.array(orientation, dtype=np.float64),
+            )
+            self.send_packet(topic, payload)
+
+        if camera is not None:
+            position, orientation = camera.get_world_pose()
+            payload = RosMessageCodec.serialize_pose(
+                np.array(position, dtype=np.float64),
+                np.array(orientation, dtype=np.float64),
+            )
+            self.send_packet(self.camera_pose_topic, payload)
+
+    def publish_joint_state_if_due(self, robots: dict[str, Robot]) -> None:
+        self.try_connect()
+        return
 
     def consume_latest_joint_state(self) -> JointStateCommand | None:
         with self.state_lock:
@@ -926,22 +1477,24 @@ class RosTcpEndpointClient:
         self.pending_service_request_id = None
         if srv_id is None:
             return
-        if destination != self.control_service_topic:
+        if destination not in self.control_service_topic_to_robot:
             response = ControlCommandResponse(
                 False, f"Unexpected service payload destination: {destination}"
             )
-            self.send_service_response(srv_id, response)
+            self.send_service_response(destination, srv_id, response)
             return
 
         try:
-            request = deserialize_control_command_request(payload)
+            request = RosMessageCodec.deserialize_control_command_request(payload)
         except Exception as exc:
             self.send_service_response(
-                srv_id, ControlCommandResponse(False, f"Failed to parse request: {exc}")
+                destination,
+                srv_id,
+                ControlCommandResponse(False, f"Failed to parse request: {exc}"),
             )
             return
 
-        pending = PendingServiceRequest(srv_id, request, threading.Event())
+        pending = PendingServiceRequest(destination, srv_id, request, threading.Event())
         with self.service_lock:
             self.pending_service_requests.append(pending)
 
@@ -950,50 +1503,163 @@ class RosTcpEndpointClient:
                 False, "ControlCommand handling timed out."
             )
         self.send_service_response(
+            destination,
             srv_id,
             pending.response or ControlCommandResponse(False, "No response generated."),
         )
 
-    def pop_service_requests(self) -> list[PendingServiceRequest]:
+    def pop_service_requests(
+        self, service_topic: str | None = None
+    ) -> list[PendingServiceRequest]:
+        normalized_topic = (
+            None if service_topic is None else RosTopic.normalize(service_topic)
+        )
         with self.service_lock:
-            requests = self.pending_service_requests
-            self.pending_service_requests = []
+            if normalized_topic is None:
+                requests = self.pending_service_requests
+                self.pending_service_requests = []
+            else:
+                requests = [
+                    request
+                    for request in self.pending_service_requests
+                    if request.service_topic == normalized_topic
+                ]
+                self.pending_service_requests = [
+                    request
+                    for request in self.pending_service_requests
+                    if request.service_topic != normalized_topic
+                ]
         return requests
 
     def send_service_response(
-        self, srv_id: int, response: ControlCommandResponse
+        self, service_topic: str, srv_id: int, response: ControlCommandResponse
     ) -> None:
         packet = b"".join(
             [
                 self.pack_syscommand("__response", {"srv_id": srv_id}),
                 self.pack_packet(
-                    self.control_service_topic,
-                    serialize_control_command_response(response),
+                    service_topic,
+                    RosMessageCodec.serialize_control_command_response(response),
                 ),
             ]
         )
         self.send_raw(packet)
 
+    def register_ros_interfaces(self) -> None:
+        raise NotImplementedError
+
+    def handle_topic_message(self, destination: str, payload: bytes) -> None:
+        return
+
     def shutdown(self) -> None:
         self.stop_event.set()
-        if self.socket is not None:
-            try:
-                self.send_packet("", b"")
-            except Exception:
-                pass
-            try:
-                self.socket.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            self.socket.close()
-            self.socket = None
+        try:
+            self.send_packet("", b"")
+        except Exception:
+            pass
+        self.close_socket()
 
 
-class JointStateFollower:
+class ManualRosClient(RosTcpClientBase):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(control_mode="manual", **kwargs)
+
+    def register_ros_interfaces(self) -> None:
+        self.send_syscommand(
+            "__subscribe",
+            {
+                "topic": self.joint_topics["left"],
+                "message_name": "sensor_msgs/JointState",
+            },
+        )
+
+    def handle_topic_message(self, destination: str, payload: bytes) -> None:
+        if destination != self.joint_topics["left"]:
+            return
+        command = RosMessageCodec.deserialize_joint_state(payload)
+        with self.state_lock:
+            self.latest_joint_state = command
+        if not self.logged_first_joint_state:
+            carb.log_info(
+                f"Received first JointState from ROS-TCP-Endpoint on {self.joint_topics['left']}"
+            )
+            self.logged_first_joint_state = True
+
+
+class AutoRosClient(RosTcpClientBase):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(control_mode="auto", **kwargs)
+
+    def register_ros_interfaces(self) -> None:
+        for joint_topic in self.joint_topics.values():
+            self.send_syscommand(
+                "__publish",
+                {
+                    "topic": joint_topic,
+                    "message_name": "sensor_msgs/JointState",
+                    "queue_size": 10,
+                    "latch": False,
+                },
+            )
+        for service_topic in self.control_service_topics.values():
+            self.send_syscommand(
+                "__unity_service",
+                {
+                    "topic": service_topic,
+                    "message_name": self.control_service_type,
+                },
+            )
+
+    def publish_joint_state_if_due(self, robots: dict[str, Robot]) -> None:
+        if not self.try_connect():
+            return
+        now = time.monotonic()
+        for robot_id, robot in robots.items():
+            if robot_id not in self.joint_topics:
+                continue
+            last_publish = self.last_joint_state_publish_times.get(robot_id, 0.0)
+            if now - last_publish < self.joint_state_publish_period:
+                continue
+            self.last_joint_state_publish_times[robot_id] = now
+            positions = robot.get_joint_positions()
+            velocities = robot.get_joint_velocities()
+            if positions is None:
+                continue
+            if velocities is None:
+                velocities = []
+            payload = RosMessageCodec.serialize_joint_state(
+                list(robot.dof_names),
+                [float(value) for value in positions],
+                [float(value) for value in velocities],
+                [],
+                self.frame_id,
+            )
+            self.send_packet(self.joint_topics[robot_id], payload)
+            if not self.logged_first_joint_state_publish:
+                carb.log_info(
+                    "Published first JointState through ROS-TCP-Endpoint "
+                    f"on {self.joint_topics[robot_id]}"
+                )
+                self.logged_first_joint_state_publish = True
+
+
+class BaseController:
     def __init__(self, robot: Robot) -> None:
         self.robot = robot
         self.controller = robot.get_articulation_controller()
+
+    def step(self, ros_client: RosTcpClientBase) -> None:
+        raise NotImplementedError
+
+
+class ManualController(BaseController):
+    def __init__(self, robot: Robot) -> None:
+        super().__init__(robot)
         self.unknown_joint_names: set[str] = set()
+
+    def step(self, ros_client: RosTcpClientBase) -> None:
+        command = ros_client.consume_latest_joint_state()
+        self.apply(command)
 
     def apply(self, command: JointStateCommand | None) -> None:
         if command is None or len(command.positions) == 0:
@@ -1026,10 +1692,10 @@ class JointStateFollower:
         )
 
 
-class AutoController:
-    def __init__(self, robot: Robot) -> None:
-        self.robot = robot
-        self.controller = robot.get_articulation_controller()
+class AutoController(BaseController):
+    def __init__(self, robot: Robot, service_topic: str) -> None:
+        super().__init__(robot)
+        self.service_topic = RosTopic.normalize(service_topic)
         self.kinematics_solver = FrankaKinematicsSolver(robot)
         self.gripper_joint_indices = np.array(
             [self.robot.get_dof_index(name) for name in GRIPPER_JOINT_NAMES],
@@ -1037,26 +1703,66 @@ class AutoController:
         )
         self.motion_phases: list[MotionPhase] = []
         self.phase_dwell_until: float | None = None
+        self.sync_kinematics_base_pose()
         self.home_ee_position, home_ee_rotation = self.compute_home_ee_pose()
         self.home_ee_orientation = rot_matrices_to_quats(home_ee_rotation)
         self.home_applied = False
 
-    def process_service_requests(self, ros_tcp_client: RosTcpEndpointClient) -> None:
-        for pending in ros_tcp_client.pop_service_requests():
+    def sync_kinematics_base_pose(self) -> None:
+        base_position, base_orientation = self.robot.get_world_pose()
+        self.kinematics_solver.get_kinematics_solver().set_robot_base_pose(
+            np.array(base_position, dtype=np.float64),
+            np.array(base_orientation, dtype=np.float64),
+        )
+
+    def compute_current_ee_pose(
+        self, position_only: bool = False
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self.sync_kinematics_base_pose()
+        return self.kinematics_solver.compute_end_effector_pose(
+            position_only=position_only
+        )
+
+    def compute_ik_action(
+        self,
+        target_position: np.ndarray,
+        target_orientation_wxyz: np.ndarray | None,
+    ) -> tuple[ArticulationAction, bool]:
+        self.sync_kinematics_base_pose()
+        return self.kinematics_solver.compute_inverse_kinematics(
+            target_position,
+            target_orientation_wxyz,
+            position_tolerance=AUTO_MOVE_POSITION_TOLERANCE,
+            orientation_tolerance=(
+                AUTO_MOVE_ORIENTATION_TOLERANCE
+                if target_orientation_wxyz is not None
+                else None
+            ),
+        )
+
+    def step(self, ros_client: RosTcpClientBase) -> None:
+        self.process_service_requests(ros_client)
+        self.step_motion()
+
+    def process_service_requests(self, ros_tcp_client: RosTcpClientBase) -> None:
+        for pending in ros_tcp_client.pop_service_requests(self.service_topic):
             pending.response = self.dispatch(pending.request)
             pending.done_event.set()
-        self.step()
 
     def dispatch(self, request: ControlCommandRequest) -> ControlCommandResponse:
-        action = request.action.strip().lower()
+        action = request.action.strip()
         try:
-            if action == "move":
-                return self.move(request.target_pose)
-            if action == "grip":
+            if action == ACTION_MOVING:
+                return self.move(request.target_pose, ACTION_MOVING)
+            if action == ACTION_CENTERING:
+                return self.move(request.target_pose, ACTION_CENTERING)
+            if action == ACTION_PLACING:
+                return self.move(request.target_pose, ACTION_PLACING)
+            if action == ACTION_GRIP:
                 return self.grip()
-            if action == "release":
+            if action == ACTION_REALEASE:
                 return self.release()
-            if action == "stop":
+            if action == ACTION_HOMING:
                 return self.stop()
             stop_response = self.stop()
             return ControlCommandResponse(
@@ -1069,11 +1775,11 @@ class AutoController:
                 False, f"Action '{request.action}' failed and stop was called: {exc}"
             )
 
-    def move(self, target_pose: PoseCommand) -> ControlCommandResponse:
-        target_orientation = quaternion_xyzw_to_wxyz(target_pose.orientation_xyzw)
-        fk_position, _ = self.kinematics_solver.compute_end_effector_pose(
-            position_only=True
-        )
+    def move(
+        self, target_pose: PoseCommand, action_name: str
+    ) -> ControlCommandResponse:
+        target_orientation = QuaternionUtils.xyzw_to_wxyz(target_pose.orientation_xyzw)
+        fk_position, _ = self.compute_current_ee_pose(position_only=True)
         horizontal_position = np.array(target_pose.position, dtype=np.float64)
         horizontal_position[2] = float(fk_position[2])
         vertical_position = np.array(target_pose.position, dtype=np.float64)
@@ -1088,10 +1794,10 @@ class AutoController:
         self.phase_dwell_until = None
         return ControlCommandResponse(
             True,
-            "Queued move: horizontal XY/orientation motion, 0.5s wait, then vertical Z descent.",
+            f"Queued {action_name}: horizontal XY/orientation motion, 0.5s wait, then vertical Z descent.",
         )
 
-    def step(self) -> None:
+    def step_motion(self) -> None:
         if self.phase_dwell_until is not None:
             if time.monotonic() < self.phase_dwell_until:
                 return
@@ -1101,15 +1807,8 @@ class AutoController:
             return
 
         target = self.motion_phases[0]
-        ik_action, success = self.kinematics_solver.compute_inverse_kinematics(
-            target.position,
-            target.orientation_wxyz,
-            position_tolerance=AUTO_MOVE_POSITION_TOLERANCE,
-            orientation_tolerance=(
-                AUTO_MOVE_ORIENTATION_TOLERANCE
-                if target.orientation_wxyz is not None
-                else None
-            ),
+        ik_action, success = self.compute_ik_action(
+            target.position, target.orientation_wxyz
         )
         if not success:
             carb.log_warn(
@@ -1120,9 +1819,7 @@ class AutoController:
             return
 
         self.apply_arm_action_preserving_gripper(ik_action)
-        fk_position, fk_rotation = self.kinematics_solver.compute_end_effector_pose(
-            position_only=False
-        )
+        fk_position, fk_rotation = self.compute_current_ee_pose(position_only=False)
         position_reached = (
             np.linalg.norm(fk_position - target.position)
             <= AUTO_MOVE_POSITION_TOLERANCE
@@ -1132,7 +1829,7 @@ class AutoController:
         else:
             current_orientation = rot_matrices_to_quats(fk_rotation)
             orientation_reached = (
-                quaternion_angular_distance_wxyz(
+                QuaternionUtils.angular_distance_wxyz(
                     current_orientation, target.orientation_wxyz
                 )
                 <= AUTO_MOVE_ORIENTATION_TOLERANCE
@@ -1210,7 +1907,7 @@ class AutoController:
     def stop(self) -> ControlCommandResponse:
         self.phase_dwell_until = None
         current_position, current_rotation = (
-            self.kinematics_solver.compute_end_effector_pose(position_only=False)
+            self.compute_current_ee_pose(position_only=False)
         )
         current_orientation = rot_matrices_to_quats(current_rotation)
         vertical_position = np.array(current_position, dtype=np.float64)
@@ -1233,6 +1930,7 @@ class AutoController:
         )
 
     def compute_home_ee_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        self.sync_kinematics_base_pose()
         kinematics = self.kinematics_solver.get_kinematics_solver()
         frame_name = self.kinematics_solver.get_end_effector_frame()
         joint_count = len(kinematics.get_joint_names())
@@ -1283,58 +1981,71 @@ def main() -> None:
         eye=np.array([1.7, 1.2, 1.0]), target=np.array([0.55, 0.0, 0.35])
     )
 
-    world = World(stage_units_in_meters=1.0)
-    if USE_DEFAULT_FRICTION:
-        world.scene.add_default_ground_plane()
+    scene = CustomScene(RANDOM_SEED)
+    scene.build(assets_root_path)
+    if set(scene.frankas) != set(ROBOT_CONFIGS):
+        carb.log_error("Failed to create both Franka robots")
+        simulation_app.close()
+        sys.exit(1)
+    scene.world.reset()
+    scene.initialize_sensors()
+    scene.world.play()
+
+    ros_tcp_client: RosTcpClientBase
+    controllers: list[BaseController]
+    ros_kwargs = {
+        "host": ROS_TCP_HOST,
+        "port": ROS_TCP_PORT,
+        "joint_topics": JOINT_STATE_TOPICS,
+        "robot_pose_topics": ROBOT_POSE_TOPICS,
+        "marker_topic": MARKER_TOPIC,
+        "image_topic": RGB_CAMERA_TOPIC,
+        "camera_pose_topic": CAMERA_POSE_TOPIC,
+        "frame_id": MARKER_FRAME_ID,
+        "publish_hz": MARKER_PUBLISH_HZ,
+        "image_publish_hz": RGB_CAMERA_PUBLISH_HZ,
+        "joint_state_publish_hz": JOINT_STATE_PUBLISH_HZ,
+        "control_service_topics": CONTROL_SERVICE_TOPICS,
+        "control_service_type": CONTROL_SERVICE_TYPE,
+        "objects": scene.spawned_objects,
+    }
+    if control_mode == "manual":
+        ros_tcp_client = ManualRosClient(**ros_kwargs)
+        controllers = [ManualController(scene.frankas["left"])]
+    elif control_mode == "auto":
+        ros_tcp_client = AutoRosClient(**ros_kwargs)
+        controllers = [
+            AutoController(scene.frankas[robot_id], CONTROL_SERVICE_TOPICS[robot_id])
+            for robot_id in ("left", "right")
+        ]
+        for controller in controllers:
+            if isinstance(controller, AutoController):
+                controller.ensure_home_pose()
     else:
-        world.scene.add_default_ground_plane(
-            static_friction=GROUND_STATIC_FRICTION,
-            dynamic_friction=GROUND_DYNAMIC_FRICTION,
-            restitution=0.0,
-        )
-    franka = add_franka(world, assets_root_path)
-    spawned_objects = add_table_and_objects(world, RANDOM_SEED)
-
-    ros_tcp_client = RosTcpEndpointClient(
-        ROS_TCP_HOST,
-        ROS_TCP_PORT,
-        control_mode,
-        JOINT_STATE_TOPIC,
-        MARKER_TOPIC,
-        MARKER_FRAME_ID,
-        MARKER_PUBLISH_HZ,
-        JOINT_STATE_PUBLISH_HZ,
-        CONTROL_SERVICE_TOPIC,
-        CONTROL_SERVICE_TYPE,
-        spawned_objects,
-    )
-
-    world.reset()
-    world.play()
-    joint_state_follower = (
-        JointStateFollower(franka) if control_mode == "manual" else None
-    )
-    auto_controller = AutoController(franka) if control_mode == "auto" else None
-    if auto_controller is not None:
-        auto_controller.ensure_home_pose()
+        raise ValueError(f"Unsupported CONTROL_MODE: {CONTROL_MODE}")
 
     reset_needed = False
+    objects_spawned = False
+    object_spawn_time = time.monotonic() + OBJECT_SPAWN_DELAY_SEC
     step_count = 0
 
     try:
         while simulation_app.is_running():
-            world.step(render=not HEADLESS)
-            if joint_state_follower is not None:
-                joint_state_follower.apply(ros_tcp_client.consume_latest_joint_state())
-            if auto_controller is not None:
-                auto_controller.process_service_requests(ros_tcp_client)
-                ros_tcp_client.publish_joint_state_if_due(franka)
+            scene.world.step(render=not HEADLESS)
+            if not objects_spawned and time.monotonic() >= object_spawn_time:
+                scene.spawn_objects()
+                objects_spawned = True
+            for controller in controllers:
+                controller.step(ros_tcp_client)
+            ros_tcp_client.publish_joint_state_if_due(scene.frankas)
+            ros_tcp_client.publish_pose_if_due(scene.frankas, scene.top_camera)
+            ros_tcp_client.publish_camera_if_due(scene.top_camera)
             ros_tcp_client.publish_if_due()
 
-            if world.is_stopped() and not reset_needed:
+            if scene.world.is_stopped() and not reset_needed:
                 reset_needed = True
-            if world.is_playing() and reset_needed:
-                world.reset()
+            if scene.world.is_playing() and reset_needed:
+                scene.world.reset()
                 reset_needed = False
 
             step_count += 1
@@ -1342,7 +2053,7 @@ def main() -> None:
                 break
     finally:
         ros_tcp_client.shutdown()
-        world.stop()
+        scene.world.stop()
         simulation_app.close()
 
 
