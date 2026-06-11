@@ -23,9 +23,9 @@ import time
 from dataclasses import dataclass
 
 # Object count controls.
-NUM_CUBES = 4
-NUM_CAPSULES = 3
-NUM_SPHERES = 4
+NUM_CUBES = 2
+NUM_CAPSULES = 1
+NUM_SPHERES = 1
 OBJECT_SIZE_SCALE = 0.5
 OBJECT_SPAWN_DELAY_SEC = 1.0
 
@@ -34,7 +34,7 @@ MARKER_FRAME_ID = "world"
 MARKER_PUBLISH_HZ = 15.0
 RGB_CAMERA_TOPIC = "/world/top_camera/image_raw"
 RGB_CAMERA_PUBLISH_HZ = 8.0
-RGB_CAMERA_RESOLUTION = (640, 480)
+RGB_CAMERA_RESOLUTION = (1024, 768)
 CAMERA_POSE_TOPIC = "/world/top_camera/pose"
 ROS_TCP_HOST = "127.0.0.1"
 ROS_TCP_PORT = 10000
@@ -75,8 +75,8 @@ HOME_JOINT_POSITIONS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.04, 0.04]
 GRIPPER_OPEN_POSITIONS = [0.04, 0.04]
 GRIPPER_CLOSED_POSITIONS = [0.0, 0.0]
 GRIPPER_JOINT_NAMES = ["panda_finger_joint1", "panda_finger_joint2"]
-AUTO_MOVE_POSITION_TOLERANCE = 0.012
-AUTO_MOVE_ORIENTATION_TOLERANCE = 0.1
+AUTO_MOVE_POSITION_TOLERANCE = 0.008
+AUTO_MOVE_ORIENTATION_TOLERANCE = 0.07
 AUTO_MOVE_DWELL_SEC = 0.5
 
 OBJECT_COLORS = {
@@ -137,12 +137,12 @@ ROBOT_CONFIGS = {
 TABLE_DIMS = np.array([0.9, 0.7, 0.08])
 TABLE_CENTER = np.array([0.6, 0.0, 0.38])
 TABLE_TOP_Z = TABLE_CENTER[2] + TABLE_DIMS[2] / 2.0
-TABLE_RIM_THICKNESS = 0.025
+TABLE_RIM_THICKNESS = 0.016
 TABLE_RIM_HEIGHT = 0.0165
 TABLE_RIM_COLOR = np.array([0.38, 0.30, 0.22])
-GOAL_SIDE_LENGTH = 0.154
+GOAL_SIDE_LENGTH = 0.200
 GOAL_DIMS = np.array([GOAL_SIDE_LENGTH, GOAL_SIDE_LENGTH, 0.008])
-GOAL_RIM_THICKNESS = 0.018
+GOAL_RIM_THICKNESS = 0.012
 GOAL_RIM_HEIGHT = 0.0105
 GOAL_TARGET_Z = TABLE_TOP_Z + GOAL_RIM_HEIGHT + 0.035
 GOAL_CORNER_MARGIN = 0.045
@@ -182,7 +182,7 @@ GOAL_ZONES = {
         "color": np.array(OBJECT_COLORS["blue"]),
     },
 }
-OBJECT_LINEAR_DAMPING = 10.0
+OBJECT_LINEAR_DAMPING = 1.0
 
 ROBOT_WORKSPACE_X_RANGE = (0.32, 0.84)
 ROBOT_WORKSPACE_Y_RANGE = (-0.26, 0.26)
@@ -2060,12 +2060,21 @@ class AutoController(BaseController):
     def apply_home_arm_direct(self) -> None:
         self.controller.apply_action(self.get_home_arm_action())
 
+    def apply_initial_gripper_open_direct(self) -> None:
+        self.controller.apply_action(
+            ArticulationAction(
+                joint_positions=np.array(GRIPPER_OPEN_POSITIONS, dtype=np.float64),
+                joint_indices=self.gripper_joint_indices,
+            )
+        )
+
     def ensure_home_pose(self) -> None:
         if self.home_applied:
             return
         self.motion_phases = []
         self.phase_dwell_until = None
         self.apply_home_arm_direct()
+        self.apply_initial_gripper_open_direct()
         self.home_applied = True
 
 

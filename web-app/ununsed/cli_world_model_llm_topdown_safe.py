@@ -111,11 +111,6 @@ ACTION_RELEASE = "Realease"
 ACTION_HOMING = "Homing"
 ALLOWED_PRIMITIVE_ACTIONS = {ACTION_MOVING, ACTION_GRIP, ACTION_RELEASE, ACTION_HOMING}
 
-GRIPPER_OPEN = "open"
-GRIPPER_CLOSED = "closed"
-GRIPPER_UNKNOWN = "unknown"
-GRIPPER_STATES = {GRIPPER_OPEN, GRIPPER_CLOSED, GRIPPER_UNKNOWN}
-
 # Interactive command behavior.
 DEFAULT_COMMAND = "빨간 물체는 빨간 목표점에, 파란 물체는 파란 목표점에 놓아라."
 USE_DEFAULT_ON_EMPTY_INPUT = True
@@ -123,9 +118,7 @@ USE_DEFAULT_ON_EMPTY_INPUT = True
 # LLM backend. "auto" tries OpenAI first when an API key exists, then Ollama.
 LLM_BACKEND = os.getenv("SEMANTIC_BACKEND", "auto").strip().lower()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_API_URL = os.getenv(
-    "OPENAI_API_URL", "https://api.openai.com/v1/chat/completions"
-)
+OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 LLM_TEMPERATURE = 0.0
@@ -156,41 +149,15 @@ BUFFER_CLEARANCE_M = 0.035
 GOAL_Z_OFFSET_M = 0.03
 BUFFER_Z_OFFSET_M = 0.0
 OUTSIDE_GOAL_Z_OFFSET_M = 0.0
-PICK_Z_OFFSET_M = -0.005
 
 # Verification.
 VERIFY_DELAY_SEC = 0.8
 VERIFY_XY_TOLERANCE_M = 0.06
 VERIFY_Z_TOLERANCE_M = 0.07
 
-# Grasp/holding reconciliation. A successful Grip service call only means the gripper
-# command was accepted; it does not prove that the object is attached. The object is
-# considered held only after a subsequent lift verifies that the marker follows the
-# end-effector. This prevents ghost-holding loops.
-CONFIRM_GRASP_AFTER_LIFT = True
-GRASP_FOLLOW_XY_TOLERANCE_M = 0.055
-GRASP_FOLLOW_Z_TOLERANCE_M = 0.075
-GRASP_FALSE_HELD_EEF_DISTANCE_M = 0.10
-
-# Gripper command-state tracking. The simulator does not publish gripper open/closed
-# state, and a top-down camera cannot infer it. The CLI therefore maintains a
-# command-state estimate. At program start, both grippers are known to be open.
-INITIAL_GRIPPER_STATE = GRIPPER_OPEN
-ENSURE_GRIPPER_OPEN_BEFORE_PICK = True
-
-# Track repeated task-level failures by object/destination/failure_type, not just
-# consecutive primitive failures. Successful intermediate Moving actions must not
-# hide repeated release/grasp failures for the same object.
-TASK_FAILURE_EMERGENCY_THRESHOLD = 3
-
-# Every pick/regrasp is preceded by a deterministic vertical retreat and high approach.
-# This is runtime-enforced; the LLM must not rely on a low-Z straight line from the
-# current pose to the object.
-SAFE_PRE_PICK_ENABLED = True
-
 # Goal placement must be stricter than "object center is inside the goal".
 # The object footprint must be fully inside the goal rectangle with this extra inward margin.
-GOAL_INTERIOR_MARGIN_M = 0.005
+GOAL_INTERIOR_MARGIN_M = 0.030
 
 # Goal drop pose scoring. Prefer robust interior placement over the shortest travel path.
 GOAL_CENTER_BIAS_WEIGHT = 2.0
@@ -200,12 +167,6 @@ GOAL_CLEARANCE_BONUS_WEIGHT = 0.35
 FINISH_VERIFY_CHECKS = 2
 FINISH_VERIFY_INTERVAL_SEC = 0.4
 
-# Final verification must be performed only after both robots have been explicitly homed.
-# This prevents the top-view verifier from accepting a task while an arm is still occluding,
-# hovering over, or interacting with the final object/goal region.
-FINAL_VERIFY_REQUIRES_ALL_ROBOTS_HOMED = True
-FINAL_HOMING_ROBOT_ORDER = ("left", "right")
-
 # Emergency recovery. If primitive/finish failures repeat, force all grippers open and home both arms.
 CONSECUTIVE_FAILURE_EMERGENCY_THRESHOLD = 3
 EMERGENCY_ROBOT_ORDER = ("left", "right")
@@ -214,15 +175,8 @@ EMERGENCY_ROBOT_ORDER = ("left", "right")
 # only after strict marker/geometry checks have passed. The camera is top-view only,
 # so visual verification must never decide whether an object is held by a gripper.
 USE_MULTIMODAL_VISUAL_VERIFICATION = True
-REQUIRE_MULTIMODAL_VISUAL_VERIFICATION = False
+REQUIRE_MULTIMODAL_VISUAL_VERIFICATION = True
 VISUAL_VERIFY_CONFIDENCE_THRESHOLD = 0.60
-
-# MarkerArray geometry is the metric source of truth. Top-down visual verification is
-# advisory only: it may add warnings, but it must not overturn a strict marker/footprint
-# predicate that already passed. This prevents false negatives caused by perspective,
-# occlusion, or the LLM treating compact symbolic coordinates incorrectly.
-VISUAL_VERIFICATION_CAN_VETO_MARKER_SUCCESS = False
-FINAL_VISUAL_VERIFICATION_CAN_VETO_MARKER_SUCCESS = False
 
 # Execution loop.
 MAX_STEPS = 120
@@ -319,9 +273,7 @@ class LLMPlan:
             "status": self.status,
             "reasoning_summary": self.reasoning_summary,
             "tool_calls": [call.as_dict() for call in self.tool_calls],
-            "goal_conditions": [
-                condition.as_dict() for condition in self.goal_conditions
-            ],
+            "goal_conditions": [condition.as_dict() for condition in self.goal_conditions],
             "rejection_reason": self.rejection_reason,
         }
 
@@ -376,12 +328,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
     return parsed
 
 
-def post_json(
-    url: str,
-    payload: dict[str, Any],
-    headers: dict[str, str],
-    timeout: int = LLM_TIMEOUT_SEC,
-) -> dict[str, Any]:
+def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = LLM_TIMEOUT_SEC) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request_object = urllib.request.Request(
         url,
@@ -468,9 +415,7 @@ def xyz_distance(a: dict[str, float], b: dict[str, float]) -> float:
     )
 
 
-def point_in_box_region(
-    point: dict[str, float], region: dict[str, Any], margin: float = 0.0
-) -> bool:
+def point_in_box_region(point: dict[str, float], region: dict[str, Any], margin: float = 0.0) -> bool:
     center = region["pose"]["position"]
     scale = region.get("scale") or region.get("size") or DEFAULT_TABLE_SIZE
     half_x = max(0.0, float(scale["x"]) * 0.5 - margin)
@@ -519,17 +464,11 @@ def object_pose_fully_inside_box_region(
     )
 
 
-def object_fully_inside_box_region(
-    obj: dict[str, Any], region: dict[str, Any], margin: float = 0.0
-) -> bool:
-    return object_pose_fully_inside_box_region(
-        obj, obj["pose"]["position"], region, margin=margin
-    )
+def object_fully_inside_box_region(obj: dict[str, Any], region: dict[str, Any], margin: float = 0.0) -> bool:
+    return object_pose_fully_inside_box_region(obj, obj["pose"]["position"], region, margin=margin)
 
 
-def make_pose(
-    position: dict[str, Any], orientation: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def make_pose(position: dict[str, Any], orientation: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "position": {
             "x": float(position["x"]),
@@ -543,10 +482,7 @@ def make_pose(
 def ros_pose_from_dict(pose_dict: dict[str, Any] | None) -> Any:
     pose = Pose()
     if pose_dict is None:
-        pose_dict = {
-            "position": DEFAULT_TABLE_CENTER,
-            "orientation": VERTICAL_EEF_ORIENTATION,
-        }
+        pose_dict = {"position": DEFAULT_TABLE_CENTER, "orientation": VERTICAL_EEF_ORIENTATION}
     position = pose_dict.get("position", {})
     pose.position = Point(
         x=float(position.get("x", 0.0)),
@@ -573,9 +509,7 @@ def image_msg_to_png_bytes(message: Any) -> bytes:
     channels = 4 if "a" in encoding else 3
     expected_min = height * step
     if len(raw) < expected_min:
-        raise ValueError(
-            f"Image data shorter than expected: got={len(raw)}, expected_at_least={expected_min}"
-        )
+        raise ValueError(f"Image data shorter than expected: got={len(raw)}, expected_at_least={expected_min}")
 
     mode = "RGBA" if channels == 4 else "RGB"
     image = Image.frombytes(mode, (width, height), raw, "raw", mode, step, 1)
@@ -633,9 +567,7 @@ class Reporter:
             table.add_row(str(key), str(value))
         self.console.print(Panel(table, title=title, expand=False))
 
-    def primitive(
-        self, step: int, decision: PrimitiveDecision, queued_after: int
-    ) -> None:
+    def primitive(self, step: int, decision: PrimitiveDecision, queued_after: int) -> None:
         rows: dict[str, Any] = {
             "step": step,
             "robot": decision.robot_id,
@@ -664,9 +596,7 @@ def read_interactive_command(reporter: Reporter) -> str:
     reporter.info("Examples:")
     for idx, example in enumerate(examples, start=1):
         reporter.info(f"  {idx}) {example}")
-    reporter.info(
-        "Type 'q' or 'quit' to exit. Press Enter to use the default command.\n"
-    )
+    reporter.info("Type 'q' or 'quit' to exit. Press Enter to use the default command.\n")
 
     while True:
         if RICH_AVAILABLE and not reporter.plain:
@@ -703,23 +633,11 @@ class RosWorldNode(Node):
 
         self.create_subscription(MarkerArray, MARKER_TOPIC, self._on_markers, 10)
         self.create_subscription(RosImage, IMAGE_TOPIC, self._on_image, 2)
-        self.create_subscription(
-            PoseStamped, CAMERA_POSE_TOPIC, self._on_camera_pose, 10
-        )
+        self.create_subscription(PoseStamped, CAMERA_POSE_TOPIC, self._on_camera_pose, 10)
         for robot_id, topic in ROBOT_POSE_TOPICS.items():
-            self.create_subscription(
-                PoseStamped,
-                topic,
-                lambda msg, rid=robot_id: self._on_robot_pose(rid, msg),
-                10,
-            )
+            self.create_subscription(PoseStamped, topic, lambda msg, rid=robot_id: self._on_robot_pose(rid, msg), 10)
         for robot_id, topic in EEF_POSE_TOPICS.items():
-            self.create_subscription(
-                PoseStamped,
-                topic,
-                lambda msg, rid=robot_id: self._on_eef_pose(rid, msg),
-                10,
-            )
+            self.create_subscription(PoseStamped, topic, lambda msg, rid=robot_id: self._on_eef_pose(rid, msg), 10)
 
         self.control_clients = {
             robot_id: self.create_client(ControlCommand, topic)
@@ -788,34 +706,20 @@ class RosWorldNode(Node):
     def readiness(self) -> dict[str, bool]:
         with self._lock:
             return {
-                "markers": self._table is not None
-                and bool(self._goals)
-                and bool(self._objects),
+                "markers": self._table is not None and bool(self._goals) and bool(self._objects),
                 "image": self._latest_image is not None,
                 "camera_pose": self._camera_pose is not None,
-                "robot_poses": all(
-                    robot_id in self._robot_poses for robot_id in ROBOT_POSE_TOPICS
-                ),
-                "eef_poses": all(
-                    robot_id in self._eef_poses for robot_id in EEF_POSE_TOPICS
-                ),
+                "robot_poses": all(robot_id in self._robot_poses for robot_id in ROBOT_POSE_TOPICS),
+                "eef_poses": all(robot_id in self._eef_poses for robot_id in EEF_POSE_TOPICS),
             }
 
     def snapshot_raw(self) -> tuple[dict[str, Any], bytes]:
         with self._lock:
-            table = (
-                dict(self._table)
-                if self._table is not None
-                else self._default_table_marker()
-            )
+            table = dict(self._table) if self._table is not None else self._default_table_marker()
             goals = {key: dict(value) for key, value in self._goals.items()}
             objects = {key: dict(value) for key, value in self._objects.items()}
             latest_image = self._latest_image
-            image_age = (
-                time.monotonic() - self._latest_image_time
-                if self._latest_image_time
-                else None
-            )
+            image_age = time.monotonic() - self._latest_image_time if self._latest_image_time else None
             camera_pose = self._camera_pose
             robot_poses = dict(self._robot_poses)
             eef_poses = dict(self._eef_poses)
@@ -837,10 +741,7 @@ class RosWorldNode(Node):
                 "image_topic": IMAGE_TOPIC,
                 "image_age_sec": image_age,
                 "image_encoding": str(latest_image.encoding),
-                "image_size": {
-                    "width": int(latest_image.width),
-                    "height": int(latest_image.height),
-                },
+                "image_size": {"width": int(latest_image.width), "height": int(latest_image.height)},
             },
             "table_marker": table,
             "goal_markers": goals,
@@ -860,16 +761,11 @@ class RosWorldNode(Node):
             "shape": "cube",
             "color": "red",
             "rgba": {"r": 0.5, "g": 0.5, "b": 0.5, "a": 1.0},
-            "pose": {
-                "position": DEFAULT_TABLE_CENTER,
-                "orientation": VERTICAL_EEF_ORIENTATION,
-            },
+            "pose": {"position": DEFAULT_TABLE_CENTER, "orientation": VERTICAL_EEF_ORIENTATION},
             "scale": DEFAULT_TABLE_SIZE,
         }
 
-    def call_control_service(
-        self, robot_id: str, action: str, target_pose: dict[str, Any] | None
-    ) -> tuple[bool, str]:
+    def call_control_service(self, robot_id: str, action: str, target_pose: dict[str, Any] | None) -> tuple[bool, str]:
         client = self.control_clients[robot_id]
         if not client.wait_for_service(timeout_sec=SERVICE_WAIT_TIMEOUT_SEC):
             return False, f"Service unavailable: {CONTROL_SERVICE_TOPICS[robot_id]}"
@@ -886,9 +782,7 @@ class RosWorldNode(Node):
             return False, f"{action} failed: {exc}"
         return bool(response.success), str(response.message)
 
-    def wait_for_eef_target(
-        self, robot_id: str, target_pose: dict[str, Any], timeout_sec: float
-    ) -> bool:
+    def wait_for_eef_target(self, robot_id: str, target_pose: dict[str, Any], timeout_sec: float) -> bool:
         target_position = target_pose["position"]
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
@@ -899,10 +793,7 @@ class RosWorldNode(Node):
                 continue
             eef_position = eef_pose["position"]
             if xy_distance(eef_position, target_position) <= EEF_POSITION_TOLERANCE_M:
-                if (
-                    abs(float(eef_position["z"]) - float(target_position["z"]))
-                    <= EEF_POSITION_TOLERANCE_M
-                ):
+                if abs(float(eef_position["z"]) - float(target_position["z"])) <= EEF_POSITION_TOLERANCE_M:
                     return True
         return False
 
@@ -916,94 +807,15 @@ class ExecutionMemory:
     def __init__(self) -> None:
         self.held_objects: dict[str, str | None] = {"left": None, "right": None}
         self.pending_grip_targets: dict[str, str | None] = {"left": None, "right": None}
-        # The simulator does not publish gripper state. Per project assumption,
-        # every run starts with both grippers open, then the CLI updates this
-        # state from accepted Grip/Realease commands.
-        self.gripper_states: dict[str, str] = {
-            "left": INITIAL_GRIPPER_STATE,
-            "right": INITIAL_GRIPPER_STATE,
-        }
-        # False by default on purpose: before final verification, the CLI must explicitly
-        # command Homing for every robot in this run.
-        self.robots_homed: dict[str, bool] = {"left": False, "right": False}
         self.history: list[dict[str, Any]] = []
         self.failed_targets: list[dict[str, Any]] = []
         self.last_verification: dict[str, Any] | None = None
-        self.task_failure_counts: dict[str, int] = {}
 
     def object_held_by(self, object_id: str) -> str | None:
         for robot_id, held_id in self.held_objects.items():
             if held_id == object_id:
                 return robot_id
         return None
-
-    def gripper_state(self, robot_id: str) -> str:
-        return self.gripper_states.get(robot_id, GRIPPER_UNKNOWN)
-
-    def gripper_is_open(self, robot_id: str) -> bool:
-        return self.gripper_state(robot_id) == GRIPPER_OPEN
-
-    def set_gripper_state(self, robot_id: str, state: str) -> None:
-        self.gripper_states[robot_id] = (
-            state if state in GRIPPER_STATES else GRIPPER_UNKNOWN
-        )
-
-    def all_grippers_open(self) -> bool:
-        return all(
-            self.gripper_state(robot_id) == GRIPPER_OPEN
-            for robot_id in CONTROL_SERVICE_TOPICS
-        )
-
-    def grippers_not_open(self) -> list[str]:
-        return [
-            robot_id
-            for robot_id in CONTROL_SERVICE_TOPICS
-            if self.gripper_state(robot_id) != GRIPPER_OPEN
-        ]
-
-    def all_robots_homed(self) -> bool:
-        return all(
-            bool(self.robots_homed.get(robot_id, False))
-            for robot_id in CONTROL_SERVICE_TOPICS
-        )
-
-    def robots_not_homed(self) -> list[str]:
-        return [
-            robot_id
-            for robot_id in FINAL_HOMING_ROBOT_ORDER
-            if not self.robots_homed.get(robot_id, False)
-        ]
-
-    def failure_key(
-        self, decision: PrimitiveDecision, failure_type: str | None = None
-    ) -> str:
-        metadata = decision.metadata or {}
-        verify = metadata.get("verify_after_action") or {}
-        destination = (
-            verify.get("region")
-            or verify.get("stage")
-            or verify.get("type")
-            or "unknown_destination"
-        )
-        object_id = decision.target_object_id or "unknown_object"
-        ftype = failure_type or decision.intent or decision.action
-        return f"{object_id}|{destination}|{ftype}"
-
-    def record_task_failure(
-        self, decision: PrimitiveDecision, failure_type: str | None = None
-    ) -> int:
-        key = self.failure_key(decision, failure_type)
-        self.task_failure_counts[key] = int(self.task_failure_counts.get(key, 0)) + 1
-        return self.task_failure_counts[key]
-
-    def reset_task_failure(
-        self, decision: PrimitiveDecision, failure_type: str | None = None
-    ) -> None:
-        key = self.failure_key(decision, failure_type)
-        self.task_failure_counts.pop(key, None)
-
-    def reset_all_task_failures(self) -> None:
-        self.task_failure_counts.clear()
 
     def append_result(self, result: ExecutionResult) -> None:
         decision = result.decision
@@ -1020,8 +832,6 @@ class ExecutionMemory:
                 "metadata": decision.metadata,
                 "held_objects": dict(self.held_objects),
                 "pending_grip_targets": dict(self.pending_grip_targets),
-                "gripper_states": dict(self.gripper_states),
-                "robots_homed": dict(self.robots_homed),
             }
         )
         if not result.success:
@@ -1041,12 +851,9 @@ class ExecutionMemory:
         return {
             "held_objects": dict(self.held_objects),
             "pending_grip_targets": dict(self.pending_grip_targets),
-            "gripper_states": dict(self.gripper_states),
-            "robots_homed": dict(self.robots_homed),
             "recent_history": self.history[-20:],
             "failed_targets": self.failed_targets[-10:],
             "last_verification": self.last_verification,
-            "task_failure_counts": dict(self.task_failure_counts),
         }
 
 
@@ -1056,28 +863,16 @@ class WorldModelBuilder:
 
     def build(self, raw: dict[str, Any]) -> dict[str, Any]:
         table_marker = raw["table_marker"]
-        table_pose = table_marker.get("pose") or {
-            "position": DEFAULT_TABLE_CENTER,
-            "orientation": VERTICAL_EEF_ORIENTATION,
-        }
+        table_pose = table_marker.get("pose") or {"position": DEFAULT_TABLE_CENTER, "orientation": VERTICAL_EEF_ORIENTATION}
         table_size = table_marker.get("scale") or DEFAULT_TABLE_SIZE
         table_center = dict(table_pose["position"])
-        table_length = max(
-            float(table_size.get("x", DEFAULT_TABLE_SIZE["x"])),
-            float(table_size.get("y", DEFAULT_TABLE_SIZE["y"])),
-        )
+        table_length = max(float(table_size.get("x", DEFAULT_TABLE_SIZE["x"])), float(table_size.get("y", DEFAULT_TABLE_SIZE["y"])))
         reach_radius = REACH_RADIUS_TABLE_SCALE * table_length
 
-        regions = self._build_regions(
-            table_marker, raw["goal_markers"], raw["object_markers"]
-        )
-        safe_pose_candidates = self._build_safe_pose_candidates(
-            regions, raw["object_markers"]
-        )
+        regions = self._build_regions(table_marker, raw["goal_markers"], raw["object_markers"])
+        safe_pose_candidates = self._build_safe_pose_candidates(regions, raw["object_markers"])
         objects = self._build_objects(raw["object_markers"], regions)
-        robots = self._build_robots(
-            raw, objects, regions, safe_pose_candidates, reach_radius
-        )
+        robots = self._build_robots(raw, objects, regions, safe_pose_candidates, reach_radius)
 
         world = {
             "timestamp_unix": raw["timestamp_unix"],
@@ -1087,8 +882,7 @@ class WorldModelBuilder:
                     "A pose is reachable when XY distance from robot base to pose <= "
                     f"{REACH_RADIUS_TABLE_SCALE:.2f} * max(table.scale.x, table.scale.y). Z is ignored."
                 ),
-                "currently_holding_rule": "Holding state is inferred from command history plus post-lift marker-follow verification; Grip success alone is not enough.",
-                "gripper_state_rule": "Gripper open/closed state is not available from ROS topics or top-down vision. At program start both grippers are open; after that the CLI updates gripper_state from accepted Grip/Realease commands.",
+                "currently_holding_rule": "Holding state is inferred from successful Moving(pick), Grip, Realease history plus marker verification.",
                 "coordinate_source_rule": "Use ROS2 MarkerArray geometry as metric ground truth; use image for qualitative layout only.",
             },
             "regions": regions,
@@ -1100,16 +894,8 @@ class WorldModelBuilder:
         }
         return world
 
-    def _build_regions(
-        self,
-        table_marker: dict[str, Any],
-        goals: dict[str, Any],
-        objects: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        table_pose = table_marker.get("pose") or {
-            "position": DEFAULT_TABLE_CENTER,
-            "orientation": VERTICAL_EEF_ORIENTATION,
-        }
+    def _build_regions(self, table_marker: dict[str, Any], goals: dict[str, Any], objects: list[dict[str, Any]]) -> dict[str, Any]:
+        table_pose = table_marker.get("pose") or {"position": DEFAULT_TABLE_CENTER, "orientation": VERTICAL_EEF_ORIENTATION}
         table_size = table_marker.get("scale") or DEFAULT_TABLE_SIZE
         regions: dict[str, Any] = {
             "table": {
@@ -1164,17 +950,13 @@ class WorldModelBuilder:
         }
         return regions
 
-    def _build_objects(
-        self, markers: list[dict[str, Any]], regions: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    def _build_objects(self, markers: list[dict[str, Any]], regions: dict[str, Any]) -> list[dict[str, Any]]:
         objects: list[dict[str, Any]] = []
         for marker in markers:
             obj = dict(marker)
             current_region = self._current_region(marker, regions)
             obj["current_region"] = current_region
-            obj["inside_goal"] = (
-                current_region[:-5] if current_region.endswith("_goal") else None
-            )
+            obj["inside_goal"] = current_region[:-5] if current_region.endswith("_goal") else None
             obj["held_by"] = self.memory.object_held_by(obj["id"])
             obj["graspable"] = obj.get("shape") in SUPPORTED_SHAPES
             obj["stable_on_table"] = obj["held_by"] is None
@@ -1212,24 +994,11 @@ class WorldModelBuilder:
                         reachable_objects.append(obj["id"])
                 for region_name, region in regions.items():
                     if region.get("type") == "goal":
-                        if self._robot_can_reach_region_candidate(
-                            base_position,
-                            safe_pose_candidates.get(f"{region['color']}_goal", []),
-                            reach_radius,
-                        ):
+                        if self._robot_can_reach_region_candidate(base_position, safe_pose_candidates.get(f"{region['color']}_goal", []), reach_radius):
                             reachable_goals.append(region_name)
                             reachable_regions.append(region_name)
-                    elif region_name in {
-                        "outside_goals",
-                        "safe_free_space",
-                        "table_center",
-                        "handover_buffer",
-                    }:
-                        if self._robot_can_reach_region_candidate(
-                            base_position,
-                            safe_pose_candidates.get(region_name, []),
-                            reach_radius,
-                        ):
+                    elif region_name in {"outside_goals", "safe_free_space", "table_center", "handover_buffer"}:
+                        if self._robot_can_reach_region_candidate(base_position, safe_pose_candidates.get(region_name, []), reach_radius):
                             reachable_regions.append(region_name)
             robots[robot_id] = {
                 "scene_label": ROBOT_SCENE_LABELS[robot_id],
@@ -1242,25 +1011,19 @@ class WorldModelBuilder:
                 "object_xy_distances": object_xy_distances,
                 "currently_holding": self.memory.held_objects.get(robot_id),
                 "pending_grip_target": self.memory.pending_grip_targets.get(robot_id),
-                "gripper_state": self.memory.gripper_state(robot_id),
                 "capabilities": {
                     "primitive_actions": sorted(ALLOWED_PRIMITIVE_ACTIONS),
                     "gripper": "parallel_gripper",
-                    "gripper_state_source": "execution_memory_command_state_not_vision",
                     "can_grasp_shapes": sorted(SUPPORTED_SHAPES),
                 },
             }
         return robots
 
-    def _build_safe_pose_candidates(
-        self, regions: dict[str, Any], objects: list[dict[str, Any]]
-    ) -> dict[str, list[dict[str, Any]]]:
+    def _build_safe_pose_candidates(self, regions: dict[str, Any], objects: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         candidates: dict[str, list[dict[str, Any]]] = {}
         for region_name, region in regions.items():
             if region.get("type") == "goal":
-                candidates[f"{region['color']}_goal"] = self._goal_drop_candidates(
-                    region, objects
-                )
+                candidates[f"{region['color']}_goal"] = self._goal_drop_candidates(region, objects)
         outside = self._outside_goal_candidates(regions, objects)
         candidates["outside_goals"] = outside
         candidates["safe_free_space"] = list(outside)
@@ -1270,9 +1033,7 @@ class WorldModelBuilder:
         candidates["handover_buffer"] = [handover_pose] if handover_pose else []
         return candidates
 
-    def _goal_drop_candidates(
-        self, goal: dict[str, Any], objects: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _goal_drop_candidates(self, goal: dict[str, Any], objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
         center = goal["center"]
         scale = goal.get("scale", DEFAULT_TABLE_SIZE)
         half_x = max(0.0, float(scale.get("x", 0.1)) * 0.5 - GOAL_MARGIN_M)
@@ -1289,38 +1050,16 @@ class WorldModelBuilder:
                     }
                 )
         points.append({"x": float(center["x"]), "y": float(center["y"]), "z": z})
-        occupied = [
-            obj
-            for obj in objects
-            if point_in_box_region(obj["pose"]["position"], goal, margin=0.0)
-        ]
-        points.sort(
-            key=lambda p: (
-                self._min_dist_to_objects(p, occupied),
-                -xy_distance(p, center),
-            ),
-            reverse=True,
-        )
-        return [
-            make_pose(point)
-            for point in points
-            if self._clear_of_objects(point, occupied, DROP_CLEARANCE_M)
-        ]
+        occupied = [obj for obj in objects if point_in_box_region(obj["pose"]["position"], goal, margin=0.0)]
+        points.sort(key=lambda p: (self._min_dist_to_objects(p, occupied), -xy_distance(p, center)), reverse=True)
+        return [make_pose(point) for point in points if self._clear_of_objects(point, occupied, DROP_CLEARANCE_M)]
 
-    def _outside_goal_candidates(
-        self, regions: dict[str, Any], objects: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _outside_goal_candidates(self, regions: dict[str, Any], objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
         table = regions["table"]
         center = table["center"]
         scale = table.get("scale", DEFAULT_TABLE_SIZE)
-        half_x = max(
-            0.0,
-            float(scale.get("x", DEFAULT_TABLE_SIZE["x"])) * 0.5 - BUFFER_CLEARANCE_M,
-        )
-        half_y = max(
-            0.0,
-            float(scale.get("y", DEFAULT_TABLE_SIZE["y"])) * 0.5 - BUFFER_CLEARANCE_M,
-        )
+        half_x = max(0.0, float(scale.get("x", DEFAULT_TABLE_SIZE["x"])) * 0.5 - BUFFER_CLEARANCE_M)
+        half_y = max(0.0, float(scale.get("y", DEFAULT_TABLE_SIZE["y"])) * 0.5 - BUFFER_CLEARANCE_M)
         object_z = self._representative_object_z(objects)
         z = object_z + OUTSIDE_GOAL_Z_OFFSET_M
         points: list[dict[str, float]] = []
@@ -1334,102 +1073,55 @@ class WorldModelBuilder:
                 if not self._point_inside_any_goal(point, regions):
                     points.append(point)
         points.sort(key=lambda p: self._min_dist_to_objects(p, objects), reverse=True)
-        return [
-            make_pose(point)
-            for point in points
-            if self._clear_of_objects(point, objects, DROP_CLEARANCE_M)
-        ]
+        return [make_pose(point) for point in points if self._clear_of_objects(point, objects, DROP_CLEARANCE_M)]
 
     def _current_region(self, obj: dict[str, Any], regions: dict[str, Any]) -> str:
         position = obj["pose"]["position"]
         for region_name, region in regions.items():
-            if region.get("type") == "goal" and object_fully_inside_box_region(
-                obj, region, margin=GOAL_INTERIOR_MARGIN_M
-            ):
+            if region.get("type") == "goal" and object_fully_inside_box_region(obj, region, margin=GOAL_INTERIOR_MARGIN_M):
                 return region_name
         handover = regions.get("handover_buffer", {}).get("pose")
-        if (
-            handover
-            and xy_distance(position, handover["position"]) <= VERIFY_XY_TOLERANCE_M
-        ):
+        if handover and xy_distance(position, handover["position"]) <= VERIFY_XY_TOLERANCE_M:
             return "handover_buffer"
         return "outside_goals"
 
-    def _point_inside_any_goal(
-        self, point: dict[str, float], regions: dict[str, Any]
-    ) -> bool:
+    def _point_inside_any_goal(self, point: dict[str, float], regions: dict[str, Any]) -> bool:
         return any(
-            region.get("type") == "goal"
-            and point_in_box_region(point, region, margin=GOAL_MARGIN_M)
+            region.get("type") == "goal" and point_in_box_region(point, region, margin=GOAL_MARGIN_M)
             for region in regions.values()
         )
 
     def _representative_object_z(self, objects: list[dict[str, Any]]) -> float:
-        z_values = [
-            float(obj["pose"]["position"]["z"]) for obj in objects if obj.get("pose")
-        ]
+        z_values = [float(obj["pose"]["position"]["z"]) for obj in objects if obj.get("pose")]
         if z_values:
             return sorted(z_values)[len(z_values) // 2]
         return DEFAULT_TABLE_CENTER["z"]
 
     @staticmethod
-    def _min_dist_to_objects(
-        point: dict[str, float], objects: list[dict[str, Any]]
-    ) -> float:
+    def _min_dist_to_objects(point: dict[str, float], objects: list[dict[str, Any]]) -> float:
         if not objects:
             return float("inf")
         return min(xy_distance(point, obj["pose"]["position"]) for obj in objects)
 
     @staticmethod
-    def _clear_of_objects(
-        point: dict[str, float], objects: list[dict[str, Any]], clearance: float
-    ) -> bool:
-        return all(
-            xy_distance(point, obj["pose"]["position"]) >= clearance for obj in objects
-        )
+    def _clear_of_objects(point: dict[str, float], objects: list[dict[str, Any]], clearance: float) -> bool:
+        return all(xy_distance(point, obj["pose"]["position"]) >= clearance for obj in objects)
 
     @staticmethod
-    def _robot_can_reach_region_candidate(
-        base_position: dict[str, float],
-        candidates: list[dict[str, Any]],
-        reach_radius: float,
-    ) -> bool:
-        return any(
-            xy_distance(base_position, candidate["position"]) <= reach_radius
-            for candidate in candidates
-            if candidate
-        )
+    def _robot_can_reach_region_candidate(base_position: dict[str, float], candidates: list[dict[str, Any]], reach_radius: float) -> bool:
+        return any(xy_distance(base_position, candidate["position"]) <= reach_radius for candidate in candidates if candidate)
 
     @staticmethod
-    def _summary(
-        objects: list[dict[str, Any]], robots: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _summary(objects: list[dict[str, Any]], robots: dict[str, Any]) -> dict[str, Any]:
         return {
             "object_count": len(objects),
             "objects_by_region": {
-                region: [
-                    obj["id"] for obj in objects if obj.get("current_region") == region
-                ]
-                for region in sorted_unique(
-                    obj.get("current_region", "unknown") for obj in objects
-                )
+                region: [obj["id"] for obj in objects if obj.get("current_region") == region]
+                for region in sorted_unique(obj.get("current_region", "unknown") for obj in objects)
             },
-            "held_objects": {
-                robot_id: robot.get("currently_holding")
-                for robot_id, robot in robots.items()
-            },
-            "gripper_states": {
-                robot_id: robot.get("gripper_state")
-                for robot_id, robot in robots.items()
-            },
-            "reachable_objects": {
-                robot_id: robot.get("reachable_objects", [])
-                for robot_id, robot in robots.items()
-            },
-            "reachable_regions": {
-                robot_id: robot.get("reachable_regions", [])
-                for robot_id, robot in robots.items()
-            },
+            "held_objects": {robot_id: robot.get("currently_holding") for robot_id, robot in robots.items()},
+            "reachable_objects": {robot_id: robot.get("reachable_objects", []) for robot_id, robot in robots.items()},
+            "reachable_regions": {robot_id: robot.get("reachable_regions", []) for robot_id, robot in robots.items()},
         }
 
 
@@ -1442,25 +1134,15 @@ class LLMSemanticPlanner:
     def __init__(self, reporter: Reporter) -> None:
         self.reporter = reporter
 
-    def plan(
-        self,
-        command: str,
-        world_model: dict[str, Any],
-        image_bytes: bytes | None,
-        feedback: str = "",
-    ) -> LLMPlan:
+    def plan(self, command: str, world_model: dict[str, Any], image_bytes: bytes | None, feedback: str = "") -> LLMPlan:
         errors: list[str] = []
         modes = [LLM_BACKEND] if LLM_BACKEND != "auto" else ["openai", "ollama"]
         for mode in modes:
             try:
                 if mode == "openai":
-                    return self._call_openai(
-                        command, world_model, image_bytes, feedback
-                    )
+                    return self._call_openai(command, world_model, image_bytes, feedback)
                 if mode == "ollama":
-                    return self._call_ollama(
-                        command, world_model, image_bytes, feedback
-                    )
+                    return self._call_ollama(command, world_model, image_bytes, feedback)
                 errors.append(f"unsupported LLM_BACKEND={mode!r}")
             except Exception as exc:
                 errors.append(f"{mode}: {exc}")
@@ -1468,14 +1150,12 @@ class LLMSemanticPlanner:
                     break
         raise RuntimeError("LLM semantic planning failed. " + " | ".join(errors))
 
-    def _prompt(
-        self, command: str, world_model: dict[str, Any], feedback: str
-    ) -> tuple[str, str]:
+    def _prompt(self, command: str, world_model: dict[str, Any], feedback: str) -> tuple[str, str]:
         system = (
             "You are an expert multi-agent robotic task planner for two Franka arms in Isaac Sim. "
             "Your job is to understand a natural-language command and convert it into MCP-like semantic tool calls. "
             "You must use the symbolic world model as metric ground truth. The image, if provided, is only for qualitative spatial confirmation. "
-            "The top-view image cannot reliably show gripper open/closed state or whether an object is held; do not infer grasp state from the image. Use the symbolic gripper_state in world_model. At program start both grippers are open; after that gripper_state is updated only from accepted Grip/Realease commands. "
+            "The top-view image cannot reliably show gripper open/closed state or whether an object is held; do not infer grasp state from the image. "
             "Do not output ROS primitives such as Moving, Grip, Realease, or Homing. The runtime will decompose semantic tools into primitives. "
             "Return only one valid JSON object.\n\n"
             "Available semantic tools:\n"
@@ -1483,23 +1163,23 @@ class LLMSemanticPlanner:
             "   Use this for moving selected objects to a supported destination region.\n"
             "   arguments schema:\n"
             "   {\n"
-            '     "object_selector": {\n'
-            '       "ids": [string] optional,\n'
-            '       "color": "red"|"blue"|"any",\n'
-            '       "shape": "cube"|"sphere"|"capsule"|"any",\n'
-            '       "current_region": "anywhere"|"inside_any_goal"|"inside_red_goal"|"inside_blue_goal"|"outside_goals"|"handover_buffer"\n'
+            "     \"object_selector\": {\n"
+            "       \"ids\": [string] optional,\n"
+            "       \"color\": \"red\"|\"blue\"|\"any\",\n"
+            "       \"shape\": \"cube\"|\"sphere\"|\"capsule\"|\"any\",\n"
+            "       \"current_region\": \"anywhere\"|\"inside_any_goal\"|\"inside_red_goal\"|\"inside_blue_goal\"|\"outside_goals\"|\"handover_buffer\"\n"
             "     },\n"
-            '     "destination": {\n'
-            '       "type": "goal"|"outside_goals"|"safe_free_space"|"table_center"|"handover_buffer",\n'
-            '       "goal_color": "red"|"blue" only when type is goal\n'
+            "     \"destination\": {\n"
+            "       \"type\": \"goal\"|\"outside_goals\"|\"safe_free_space\"|\"table_center\"|\"handover_buffer\",\n"
+            "       \"goal_color\": \"red\"|\"blue\" only when type is goal\n"
             "     },\n"
-            '     "ordering": "nearest_first"|"left_to_right"|"right_to_left"|"as_listed",\n'
-            '     "handover_policy": "use_if_needed"\n'
+            "     \"ordering\": \"nearest_first\"|\"left_to_right\"|\"right_to_left\"|\"as_listed\",\n"
+            "     \"handover_policy\": \"use_if_needed\"\n"
             "   }\n"
             "2) reject_task\n"
             "   Use this only when the command is unsafe, ambiguous, references unknown objects/regions/colors/shapes, or asks to move outside the safe table workspace.\n"
             "   Do NOT use reject_task for reachability limitations, because the runtime computes direct and handover routes after your semantic extraction.\n"
-            '   arguments schema: {"reason": string}\n\n'
+            "   arguments schema: {\"reason\": string}\n\n"
             "Supported colors: red, blue. Supported shapes: cube, sphere, capsule.\n"
             "Supported destination types: goal, outside_goals, safe_free_space, table_center, handover_buffer.\n"
             "Division of responsibility:\n"
@@ -1507,17 +1187,6 @@ class LLMSemanticPlanner:
             "- Runtime job: compute source robot, destination robot, direct route, handover route, exact poses, and feasibility.\n"
             "- Never reject because one robot cannot reach both the object and destination. That is exactly when handover may be required.\n"
             "- If the object is on the left side and the goal is on the right side, still output move_objects with handover_policy=use_if_needed.\n"
-            "Motion-safety awareness:\n"
-            "- Important: a point-to-point move from A to B is not automatically safe. The low-level controller may move the end-effector horizontally along a nearly straight XY path before descending.\n"
-            "- Therefore, a straight transfer can sweep through intermediate objects and collide with, push, or knock them over even when both A and B themselves are safe poses.\n"
-            "- Do not reason as if only the start and destination points matter. Intermediate path occupancy matters.\n"
-            "- If the command involves moving an object through a crowded area, between objects, across the table, or near goal/table boundaries, explicitly mention in reasoning_summary that the runtime must use lifted/clearance motion and collision-aware safe waypoints.\n"
-            "- Gripper-state safety is critical: if a robot gripper_state is closed and it is not confirmed to be holding the intended object, the runtime must open the gripper before moving down to pick/regrasp. Do not assume the gripper is open unless world_model.robots[robot].gripper_state says open.\n"
-            "- Regrasp/retry safety is critical: after a failed pick, failed grip, failed release, or handover-buffer failure, do not assume the next attempt may move straight from the current center/buffer pose back to the object. A direct center-to-object XY sweep can hit the same object and push it farther away, causing an infinite failure loop.\n"
-            "- When execution feedback reports a grasp/regrasp failure, pushed object, missed object, or repeated retry, keep the original semantic target if it is still the intended object, but explicitly state that runtime must recover first: retreat/home or lift to a high clearance pose, release if any gripper may be closed, then approach the object from above using a collision-aware path that avoids sweeping through the object or nearby objects.\n"
-            "- For table_center and handover_buffer tasks, treat the center/buffer area as an occupied work zone during retries. Do not describe a retry as simply moving from center/buffer directly to the object; require a safe retreat and overhead re-approach before regrasping.\n"
-            "- Replanning after a manipulation failure must not broaden the task to unrelated objects. Preserve the original object set and destination unless the user command itself asks for a broader task.\n"
-            "- You still must not output low-level waypoints or ROS primitives. The runtime will compute lift, approach, handover, safe retreat, and safe intermediate poses.\n"
             "Safety rules:\n"
             "- Do not allow off-table drops. If user asks to drop outside the table, reject_task.\n"
             "- Do not invent object IDs, regions, colors, or shapes.\n"
@@ -1532,11 +1201,11 @@ class LLMSemanticPlanner:
             "- '빨간 캡슐을 테이블 밖으로 떨어트려라' => rejected because off-table drop is unsafe.\n\n"
             "Output schema:\n"
             "{\n"
-            '  "status": "accepted"|"rejected",\n'
-            '  "reasoning_summary": string,\n'
-            '  "plan": [ {"tool": "move_objects", "arguments": {...}, "reason": string} ],\n'
-            '  "goal_conditions": [ optional high-level success conditions ],\n'
-            '  "rejection_reason": string optional\n'
+            "  \"status\": \"accepted\"|\"rejected\",\n"
+            "  \"reasoning_summary\": string,\n"
+            "  \"plan\": [ {\"tool\": \"move_objects\", \"arguments\": {...}, \"reason\": string} ],\n"
+            "  \"goal_conditions\": [ optional high-level success conditions ],\n"
+            "  \"rejection_reason\": string optional\n"
             "}\n"
         )
         compact_world = self._compact_world_for_llm(world_model)
@@ -1545,7 +1214,7 @@ class LLMSemanticPlanner:
                 "user_command": command,
                 "world_model": compact_world,
                 "execution_feedback": feedback,
-                "required_response": "Return one JSON object using the output schema. Extract semantic intent with move_objects whenever possible. Use reject_task only for unsafe, unknown, or ambiguous commands; never reject because a handover may be required. Remember that point-to-point straight motion can collide with intermediate objects, and remember that a robot with a closed gripper must be opened before pick/regrasp unless it is confirmed to hold the intended object. If feedback mentions failed grasp/regrasp/retry or an object being pushed, preserve the original target and explicitly require safe retreat/home or high-clearance recovery before re-approach; do not imply a direct center/buffer-to-object retry. Mention lifted/clearance and collision-aware safe routing in reasoning when relevant, but do not output ROS primitives or raw waypoints.",
+                "required_response": "Return one JSON object using the output schema. Extract semantic intent with move_objects whenever possible. Use reject_task only for unsafe, unknown, or ambiguous commands; never reject because a handover may be required.",
             },
             ensure_ascii=False,
             indent=2,
@@ -1595,22 +1264,13 @@ class LLMSemanticPlanner:
             "runtime_state": world.get("runtime_state"),
         }
 
-    def _route_capabilities_for_llm(
-        self, world: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    def _route_capabilities_for_llm(self, world: dict[str, Any]) -> list[dict[str, Any]]:
         """Summarize direct/handover route options so the LLM does not guess feasibility.
 
         This is advisory context only. The runtime recomputes route feasibility before
         executing, but the summary helps the LLM avoid rejecting cross-workspace tasks.
         """
-        destinations = [
-            "red_goal",
-            "blue_goal",
-            "outside_goals",
-            "safe_free_space",
-            "table_center",
-            "handover_buffer",
-        ]
+        destinations = ["red_goal", "blue_goal", "outside_goals", "safe_free_space", "table_center", "handover_buffer"]
         rows: list[dict[str, Any]] = []
         for obj in world.get("objects", []):
             source_robots = []
@@ -1629,16 +1289,9 @@ class LLMSemanticPlanner:
                 destination_robots = [
                     robot_id
                     for robot_id in world.get("robots", {})
-                    if any(
-                        self._robot_can_reach_pose_for_llm(world, robot_id, pose)
-                        for pose in candidates
-                    )
+                    if any(self._robot_can_reach_pose_for_llm(world, robot_id, pose) for pose in candidates)
                 ]
-                direct_pairs = [
-                    robot_id
-                    for robot_id in source_robots
-                    if robot_id in destination_robots
-                ]
+                direct_pairs = [robot_id for robot_id in source_robots if robot_id in destination_robots]
                 handover_pairs: list[dict[str, str]] = []
                 if not direct_pairs and source_robots and destination_robots:
                     for src in source_robots:
@@ -1646,13 +1299,7 @@ class LLMSemanticPlanner:
                             if src == dst:
                                 continue
                             if self._robots_share_handover_for_llm(world, src, dst):
-                                handover_pairs.append(
-                                    {
-                                        "source_robot": src,
-                                        "destination_robot": dst,
-                                        "handover_region": "handover_buffer",
-                                    }
-                                )
+                                handover_pairs.append({"source_robot": src, "destination_robot": dst, "handover_region": "handover_buffer"})
                 dest_rows[dest] = {
                     "destination_robots": destination_robots,
                     "direct_robots": direct_pairs,
@@ -1673,20 +1320,14 @@ class LLMSemanticPlanner:
         return rows
 
     @staticmethod
-    def _robot_can_reach_pose_for_llm(
-        world: dict[str, Any], robot_id: str, pose: dict[str, Any]
-    ) -> bool:
+    def _robot_can_reach_pose_for_llm(world: dict[str, Any], robot_id: str, pose: dict[str, Any]) -> bool:
         robot = world.get("robots", {}).get(robot_id, {})
         base_pose = robot.get("base_pose")
         if not base_pose or not pose:
             return False
-        return xy_distance(base_pose["position"], pose["position"]) <= float(
-            robot.get("reach_radius") or 0.0
-        )
+        return xy_distance(base_pose["position"], pose["position"]) <= float(robot.get("reach_radius") or 0.0)
 
-    def _robots_share_handover_for_llm(
-        self, world: dict[str, Any], src: str, dst: str
-    ) -> bool:
+    def _robots_share_handover_for_llm(self, world: dict[str, Any], src: str, dst: str) -> bool:
         candidates = world.get("safe_pose_candidates", {}).get("handover_buffer", [])
         if not candidates:
             candidates = world.get("safe_pose_candidates", {}).get("table_center", [])
@@ -1696,24 +1337,14 @@ class LLMSemanticPlanner:
             for pose in candidates
         )
 
-    def _call_openai(
-        self,
-        command: str,
-        world_model: dict[str, Any],
-        image_bytes: bytes | None,
-        feedback: str,
-    ) -> LLMPlan:
-        api_key = (
-            os.getenv("OPENAI_API_KEY") or os.getenv("CHATGPT_API_KEY") or ""
-        ).strip()
+    def _call_openai(self, command: str, world_model: dict[str, Any], image_bytes: bytes | None, feedback: str) -> LLMPlan:
+        api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("CHATGPT_API_KEY") or "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY or CHATGPT_API_KEY is not set")
         system, user = self._prompt(command, world_model, feedback)
         content: Any = [{"type": "text", "text": user}]
         if SEND_IMAGE_TO_LLM and image_bytes:
-            content.append(
-                {"type": "image_url", "image_url": {"url": image_data_url(image_bytes)}}
-            )
+            content.append({"type": "image_url", "image_url": {"url": image_data_url(image_bytes)}})
         payload = {
             "model": OPENAI_MODEL,
             "messages": [
@@ -1723,25 +1354,13 @@ class LLMSemanticPlanner:
             "temperature": LLM_TEMPERATURE,
             "response_format": {"type": "json_object"},
         }
-        response = post_json(
-            OPENAI_API_URL, payload, {"Authorization": f"Bearer {api_key}"}
-        )
+        response = post_json(OPENAI_API_URL, payload, {"Authorization": f"Bearer {api_key}"})
         choices = response.get("choices") or []
-        message = (
-            choices[0].get("message")
-            if choices and isinstance(choices[0], dict)
-            else {}
-        )
+        message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
         parsed = extract_json_object(str((message or {}).get("content") or ""))
         return self._parse_plan(parsed)
 
-    def _call_ollama(
-        self,
-        command: str,
-        world_model: dict[str, Any],
-        image_bytes: bytes | None,
-        feedback: str,
-    ) -> LLMPlan:
+    def _call_ollama(self, command: str, world_model: dict[str, Any], image_bytes: bytes | None, feedback: str) -> LLMPlan:
         system, user = self._prompt(command, world_model, feedback)
         message: dict[str, Any] = {"role": "user", "content": user}
         if SEND_IMAGE_TO_LLM and image_bytes:
@@ -1758,9 +1377,7 @@ class LLMSemanticPlanner:
         }
         response = post_json(OLLAMA_URL, payload, {})
         msg = response.get("message") or {}
-        parsed = extract_json_object(
-            str(msg.get("content") or response.get("response") or "")
-        )
+        parsed = extract_json_object(str(msg.get("content") or response.get("response") or ""))
         return self._parse_plan(parsed)
 
     def _parse_plan(self, parsed: dict[str, Any]) -> LLMPlan:
@@ -1774,28 +1391,18 @@ class LLMSemanticPlanner:
             else:
                 raise ValueError(f"LLM plan lacks valid status: {parsed}")
         rejection_reason = str(parsed.get("rejection_reason") or "").strip()
-        reasoning = str(
-            parsed.get("reasoning_summary") or parsed.get("reason") or ""
-        ).strip()
+        reasoning = str(parsed.get("reasoning_summary") or parsed.get("reason") or "").strip()
         if status == "rejected":
             if not rejection_reason:
-                args = (
-                    parsed.get("arguments")
-                    if isinstance(parsed.get("arguments"), dict)
-                    else {}
-                )
-                rejection_reason = str(
-                    (args or {}).get("reason") or reasoning or "task rejected by LLM"
-                ).strip()
+                args = parsed.get("arguments") if isinstance(parsed.get("arguments"), dict) else {}
+                rejection_reason = str((args or {}).get("reason") or reasoning or "task rejected by LLM").strip()
             return LLMPlan("rejected", reasoning, [], [], parsed, rejection_reason)
 
         raw_plan = parsed.get("plan")
         if raw_plan is None and parsed.get("tool"):
             raw_plan = [parsed]
         if not isinstance(raw_plan, list) or not raw_plan:
-            raise ValueError(
-                f"accepted LLM plan must include non-empty plan list: {parsed}"
-            )
+            raise ValueError(f"accepted LLM plan must include non-empty plan list: {parsed}")
         tool_calls: list[SemanticToolCall] = []
         for item in raw_plan:
             if not isinstance(item, dict):
@@ -1822,33 +1429,23 @@ class PlanValidator:
             raise ValueError("LLM plan has no tool calls")
         for call in plan.tool_calls:
             if call.tool == "reject_task":
-                reason = str(
-                    call.arguments.get("reason") or call.reason or "task rejected"
-                )
+                reason = str(call.arguments.get("reason") or call.reason or "task rejected")
                 raise ValueError(reason)
             if call.tool != "move_objects":
                 raise ValueError(f"Unsupported semantic tool: {call.tool!r}")
             self._validate_move_objects(call, world)
         return plan
 
-    def _validate_move_objects(
-        self, call: SemanticToolCall, world: dict[str, Any]
-    ) -> None:
+    def _validate_move_objects(self, call: SemanticToolCall, world: dict[str, Any]) -> None:
         selector = self._selector(call)
         destination = self._destination(call)
 
         if selector.get("color", "any") not in SUPPORTED_COLORS | {"any"}:
-            raise ValueError(
-                f"Unsupported object color selector: {selector.get('color')!r}"
-            )
+            raise ValueError(f"Unsupported object color selector: {selector.get('color')!r}")
         if selector.get("shape", "any") not in SUPPORTED_SHAPES | {"any"}:
-            raise ValueError(
-                f"Unsupported object shape selector: {selector.get('shape')!r}"
-            )
+            raise ValueError(f"Unsupported object shape selector: {selector.get('shape')!r}")
         if selector.get("current_region", "anywhere") not in SUPPORTED_CURRENT_REGIONS:
-            raise ValueError(
-                f"Unsupported current_region selector: {selector.get('current_region')!r}"
-            )
+            raise ValueError(f"Unsupported current_region selector: {selector.get('current_region')!r}")
 
         ids = selector.get("ids") or []
         if ids:
@@ -1865,13 +1462,9 @@ class PlanValidator:
         if dest_type == "goal":
             goal_color = destination.get("goal_color")
             if goal_color not in SUPPORTED_COLORS:
-                raise ValueError(
-                    f"goal destination requires goal_color red|blue, got {goal_color!r}"
-                )
+                raise ValueError(f"goal destination requires goal_color red|blue, got {goal_color!r}")
             if f"{goal_color}_goal" not in world.get("regions", {}):
-                raise ValueError(
-                    f"Requested goal does not exist in world: {goal_color}_goal"
-                )
+                raise ValueError(f"Requested goal does not exist in world: {goal_color}_goal")
 
         matched = select_objects(world, selector)
         # It is not an error for source-filtered tasks to match none; verifier may immediately finish.
@@ -1915,28 +1508,16 @@ def normalize_selector(selector: dict[str, Any]) -> dict[str, Any]:
         current_region = "inside_red_goal"
     if current_region == "blue_goal":
         current_region = "inside_blue_goal"
-    return {
-        "ids": ids,
-        "color": color,
-        "shape": shape,
-        "current_region": current_region,
-    }
+    return {"ids": ids, "color": color, "shape": shape, "current_region": current_region}
 
 
 def normalize_destination(destination: dict[str, Any]) -> dict[str, Any]:
-    dest_type = (
-        str(destination.get("type") or destination.get("region") or "").strip().lower()
-    )
+    dest_type = str(destination.get("type") or destination.get("region") or "").strip().lower()
     if dest_type in {"red_goal", "blue_goal"}:
         goal_color = dest_type.split("_", 1)[0]
         dest_type = "goal"
     else:
-        goal_color = (
-            str(destination.get("goal_color") or destination.get("color") or "")
-            .strip()
-            .lower()
-            or None
-        )
+        goal_color = str(destination.get("goal_color") or destination.get("color") or "").strip().lower() or None
     if dest_type in {"outside_goal", "outside_goal_regions", "outside"}:
         dest_type = "outside_goals"
     if dest_type in {"free_space", "empty_space", "safe_space"}:
@@ -1946,9 +1527,7 @@ def normalize_destination(destination: dict[str, Any]) -> dict[str, Any]:
     return {"type": dest_type, "goal_color": goal_color}
 
 
-def select_objects(
-    world: dict[str, Any], selector: dict[str, Any]
-) -> list[dict[str, Any]]:
+def select_objects(world: dict[str, Any], selector: dict[str, Any]) -> list[dict[str, Any]]:
     selector = normalize_selector(selector)
     ids = set(selector.get("ids") or [])
     color = selector.get("color", "any")
@@ -1989,40 +1568,16 @@ class SemanticRuntime:
         self.primitive_queue: list[PrimitiveDecision] = []
         self.active_object_id: str | None = None
         self.concrete_goal_conditions: list[SemanticGoalCondition] = []
-        # Immutable execution scope derived from the first accepted semantic plan.
-        # Replanning may change strategy, but it must not expand the task to unrelated objects.
-        self.locked_object_destinations: dict[str, dict[str, Any]] = {}
-        self.locked_source_tool_calls: dict[str, SemanticToolCall] = {}
 
     def load_plan(self, plan: LLMPlan, world: dict[str, Any]) -> None:
         self.plan = plan
         self.primitive_queue.clear()
         self.active_object_id = None
-        if not self.locked_object_destinations:
-            self._lock_initial_task_scope(plan, world)
-        self.concrete_goal_conditions = self._derive_goal_conditions_from_locked_scope(
-            world
-        )
+        self.concrete_goal_conditions = self._derive_goal_conditions(plan, world)
 
     def clear_plan(self) -> None:
         self.primitive_queue.clear()
         self.active_object_id = None
-
-    def _next_required_final_homing_decision(self) -> PrimitiveDecision | None:
-        if not FINAL_VERIFY_REQUIRES_ALL_ROBOTS_HOMED:
-            return None
-        for robot_id in FINAL_HOMING_ROBOT_ORDER:
-            if not self.memory.robots_homed.get(robot_id, False):
-                return PrimitiveDecision(
-                    robot_id=robot_id,
-                    action=ACTION_HOMING,
-                    target_pose=None,
-                    target_object_id=None,
-                    intent="final_home",
-                    reason="Home this robot before final task verification.",
-                    metadata={"final_homing_before_verification": True},
-                )
-        return None
 
     def next_decision(self, world: dict[str, Any]) -> PrimitiveDecision:
         if self.primitive_queue:
@@ -2031,76 +1586,20 @@ class SemanticRuntime:
             raise RuntimeError("No semantic plan loaded")
         task = self._select_next_object_task(world)
         if task is None:
-            final_homing = self._next_required_final_homing_decision()
-            if final_homing is not None:
-                return final_homing
             return PrimitiveDecision(
                 robot_id=None,
                 action=ACTION_HOMING,
                 intent="finish",
                 done=True,
-                reason="All semantic goal conditions appear satisfied and all robots are homed; final verifier will confirm.",
+                reason="All semantic goal conditions appear satisfied; final verifier will confirm.",
             )
         self.active_object_id = task.object_id
         self.primitive_queue = self._decompose_task(world, task)
         if not self.primitive_queue:
-            raise RuntimeError(
-                f"Generated empty primitive queue for object {task.object_id}"
-            )
+            raise RuntimeError(f"Generated empty primitive queue for object {task.object_id}")
         return self.primitive_queue.pop(0)
 
-    def _lock_initial_task_scope(self, plan: LLMPlan, world: dict[str, Any]) -> None:
-        for call in plan.tool_calls:
-            if call.tool != "move_objects":
-                continue
-            selector = normalize_selector(call.arguments.get("object_selector") or {})
-            destination = normalize_destination(call.arguments.get("destination") or {})
-            for obj in select_objects(world, selector):
-                object_id = str(obj["id"])
-                if object_id not in self.locked_object_destinations:
-                    self.locked_object_destinations[object_id] = dict(destination)
-                    self.locked_source_tool_calls[object_id] = call
-
-    def _derive_goal_conditions_from_locked_scope(
-        self, world: dict[str, Any]
-    ) -> list[SemanticGoalCondition]:
-        conditions: list[SemanticGoalCondition] = []
-        grouped: dict[tuple[str, str | None], list[str]] = {}
-        for object_id, destination in self.locked_object_destinations.items():
-            dest_type = destination.get("type")
-            key_region: str | None
-            if dest_type == "goal":
-                key_region = f"{destination.get('goal_color')}_goal"
-                grouped.setdefault(("objects_in_goal", key_region), []).append(
-                    object_id
-                )
-            elif dest_type in {"outside_goals", "safe_free_space"}:
-                grouped.setdefault(
-                    ("objects_outside_goals", "outside_goals"), []
-                ).append(object_id)
-            elif dest_type in {"table_center", "handover_buffer"}:
-                grouped.setdefault(("objects_near_region_pose", dest_type), []).append(
-                    object_id
-                )
-        for (condition_type, region), object_ids in grouped.items():
-            conditions.append(
-                SemanticGoalCondition(
-                    condition_type=condition_type,
-                    object_ids=sorted_unique(object_ids),
-                    required_region=region,
-                    required_goal_color=(
-                        region.split("_", 1)[0]
-                        if region and region.endswith("_goal")
-                        else None
-                    ),
-                    description="immutable goal condition derived from the first accepted plan",
-                )
-            )
-        return conditions
-
-    def _derive_goal_conditions(
-        self, plan: LLMPlan, world: dict[str, Any]
-    ) -> list[SemanticGoalCondition]:
+    def _derive_goal_conditions(self, plan: LLMPlan, world: dict[str, Any]) -> list[SemanticGoalCondition]:
         conditions: list[SemanticGoalCondition] = []
         for call in plan.tool_calls:
             if call.tool != "move_objects":
@@ -2146,55 +1645,12 @@ class SemanticRuntime:
     def _select_next_object_task(self, world: dict[str, Any]) -> ObjectTask | None:
         if self.plan is None:
             return None
-        if self.locked_object_destinations:
-            candidates: list[ObjectTask] = []
-            rank = 0
-            for object_id, destination in self.locked_object_destinations.items():
-                obj = get_object(world, object_id)
-                if obj is None:
-                    continue
-                if self._object_satisfies_destination(obj, destination, world):
-                    continue
-                route = self._choose_route(obj, destination, world)
-                if route is None:
-                    continue
-                rank += 1
-                call = self.locked_source_tool_calls.get(object_id) or SemanticToolCall(
-                    "move_objects",
-                    {
-                        "object_selector": {"ids": [object_id]},
-                        "destination": destination,
-                        "handover_policy": "use_if_needed",
-                    },
-                    "Locked initial task scope fallback.",
-                )
-                candidates.append(
-                    ObjectTask(
-                        object_id=object_id,
-                        route=route,
-                        source_tool_call=call,
-                        destination=destination,
-                        rank=rank,
-                        rationale=f"Process {object_id} using {route.route_type}: {route.reason}",
-                    )
-                )
-            if not candidates:
-                return None
-            candidates.sort(
-                key=lambda task: (task.route.score, task.rank, task.object_id)
-            )
-            return candidates[0]
-
         candidates: list[ObjectTask] = []
         rank = 0
         for call in self.plan.tool_calls:
             selector = normalize_selector(call.arguments.get("object_selector") or {})
             destination = normalize_destination(call.arguments.get("destination") or {})
-            objects = self._order_objects(
-                select_objects(world, selector),
-                call.arguments.get("ordering") or "nearest_first",
-                world,
-            )
+            objects = self._order_objects(select_objects(world, selector), call.arguments.get("ordering") or "nearest_first", world)
             for obj in objects:
                 if self._object_satisfies_destination(obj, destination, world):
                     continue
@@ -2217,9 +1673,7 @@ class SemanticRuntime:
         candidates.sort(key=lambda task: (task.route.score, task.rank, task.object_id))
         return candidates[0]
 
-    def _order_objects(
-        self, objects: list[dict[str, Any]], ordering: str, world: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    def _order_objects(self, objects: list[dict[str, Any]], ordering: str, world: dict[str, Any]) -> list[dict[str, Any]]:
         ordering = str(ordering or "nearest_first").strip().lower()
         if ordering == "left_to_right":
             return sorted(objects, key=lambda obj: float(obj["pose"]["position"]["x"]))
@@ -2227,56 +1681,36 @@ class SemanticRuntime:
             return sorted(objects, key=lambda obj: -float(obj["pose"]["position"]["x"]))
         if ordering == "as_listed":
             return list(objects)
-
         # nearest_first by nearest robot base distance.
         def nearest_robot_distance(obj: dict[str, Any]) -> float:
             distances: list[float] = []
             for robot in world.get("robots", {}).values():
                 base_pose = robot.get("base_pose")
                 if base_pose:
-                    distances.append(
-                        xy_distance(base_pose["position"], obj["pose"]["position"])
-                    )
+                    distances.append(xy_distance(base_pose["position"], obj["pose"]["position"]))
             return min(distances) if distances else float("inf")
 
         return sorted(objects, key=lambda obj: (nearest_robot_distance(obj), obj["id"]))
 
-    def _object_satisfies_destination(
-        self, obj: dict[str, Any], destination: dict[str, Any], world: dict[str, Any]
-    ) -> bool:
+    def _object_satisfies_destination(self, obj: dict[str, Any], destination: dict[str, Any], world: dict[str, Any]) -> bool:
         dest_type = destination["type"]
         if dest_type == "goal":
             goal = world.get("regions", {}).get(f"{destination['goal_color']}_goal")
-            return bool(
-                goal
-                and object_fully_inside_box_region(
-                    obj, goal, margin=GOAL_INTERIOR_MARGIN_M
-                )
-            )
+            return bool(goal and object_fully_inside_box_region(obj, goal, margin=GOAL_INTERIOR_MARGIN_M))
         if dest_type in {"outside_goals", "safe_free_space"}:
             return obj.get("current_region") == "outside_goals"
         if dest_type in {"table_center", "handover_buffer"}:
             pose = world.get("regions", {}).get(dest_type, {}).get("pose")
-            return bool(
-                pose
-                and xy_distance(obj["pose"]["position"], pose["position"])
-                <= VERIFY_XY_TOLERANCE_M
-            )
+            return bool(pose and xy_distance(obj["pose"]["position"], pose["position"]) <= VERIFY_XY_TOLERANCE_M)
         return False
 
-    def _choose_route(
-        self, obj: dict[str, Any], destination: dict[str, Any], world: dict[str, Any]
-    ) -> RouteCandidate | None:
+    def _choose_route(self, obj: dict[str, Any], destination: dict[str, Any], world: dict[str, Any]) -> RouteCandidate | None:
         drop_pose = self._select_drop_pose(obj, destination, world)
         if drop_pose is None:
             return None
 
         held_by = obj.get("held_by") or self.memory.object_held_by(obj["id"])
-        source_robots = (
-            [held_by]
-            if held_by
-            else self._robots_that_can_reach_pose(world, obj["pose"])
-        )
+        source_robots = [held_by] if held_by else self._robots_that_can_reach_pose(world, obj["pose"])
         destination_robots = self._robots_that_can_reach_pose(world, drop_pose)
         if not source_robots or not destination_robots:
             return None
@@ -2296,9 +1730,7 @@ class SemanticRuntime:
                         reason=f"robot {src} can reach both source and destination",
                     )
 
-        buffer_pose = self._select_handover_buffer_pose(
-            obj, world, source_robots, destination_robots
-        )
+        buffer_pose = self._select_handover_buffer_pose(obj, world, source_robots, destination_robots)
         if buffer_pose is None:
             return None
         best: RouteCandidate | None = None
@@ -2323,41 +1755,24 @@ class SemanticRuntime:
                     best = candidate
         return best
 
-    def _select_drop_pose(
-        self, obj: dict[str, Any], destination: dict[str, Any], world: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    def _select_drop_pose(self, obj: dict[str, Any], destination: dict[str, Any], world: dict[str, Any]) -> dict[str, Any] | None:
         dest_type = destination["type"]
         if dest_type == "goal":
-            goal_region = world.get("regions", {}).get(
-                f"{destination['goal_color']}_goal"
-            )
+            goal_region = world.get("regions", {}).get(f"{destination['goal_color']}_goal")
             if not goal_region:
                 return None
             candidates = self._goal_drop_candidates_for_object(obj, goal_region, world)
-            score_fn = lambda candidate: self._goal_drop_score(
-                obj, candidate, goal_region, world
-            )
-        elif dest_type in {
-            "outside_goals",
-            "safe_free_space",
-            "table_center",
-            "handover_buffer",
-        }:
+            score_fn = lambda candidate: self._goal_drop_score(obj, candidate, goal_region, world)
+        elif dest_type in {"outside_goals", "safe_free_space", "table_center", "handover_buffer"}:
             candidates = world.get("safe_pose_candidates", {}).get(dest_type, [])
-            score_fn = lambda candidate: 0.1 * xy_distance(
-                obj["pose"]["position"], candidate["position"]
-            )
+            score_fn = lambda candidate: 0.1 * xy_distance(obj["pose"]["position"], candidate["position"])
         else:
             return None
         if not candidates:
             return None
         best: tuple[float, dict[str, Any]] | None = None
         for candidate in candidates:
-            reachable_count = sum(
-                1
-                for robot_id in CONTROL_SERVICE_TOPICS
-                if self._robot_can_reach_pose(world, robot_id, candidate)
-            )
+            reachable_count = sum(1 for robot_id in CONTROL_SERVICE_TOPICS if self._robot_can_reach_pose(world, robot_id, candidate))
             if reachable_count <= 0:
                 continue
             score = score_fn(candidate) - float(reachable_count)
@@ -2365,9 +1780,7 @@ class SemanticRuntime:
                 best = (score, candidate)
         return best[1] if best else None
 
-    def _goal_drop_candidates_for_object(
-        self, obj: dict[str, Any], goal: dict[str, Any], world: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    def _goal_drop_candidates_for_object(self, obj: dict[str, Any], goal: dict[str, Any], world: dict[str, Any]) -> list[dict[str, Any]]:
         """Generate object-aware goal poses that keep the full object footprint inside the goal."""
         center = goal["center"]
         scale = goal.get("scale", DEFAULT_TABLE_SIZE)
@@ -2383,12 +1796,8 @@ class SemanticRuntime:
             for iy in range(grid_n):
                 raw_points.append(
                     {
-                        "x": float(center["x"])
-                        - half_x
-                        + 2.0 * half_x * ix / max(1, grid_n - 1),
-                        "y": float(center["y"])
-                        - half_y
-                        + 2.0 * half_y * iy / max(1, grid_n - 1),
+                        "x": float(center["x"]) - half_x + 2.0 * half_x * ix / max(1, grid_n - 1),
+                        "y": float(center["y"]) - half_y + 2.0 * half_y * iy / max(1, grid_n - 1),
                         "z": z,
                     }
                 )
@@ -2401,9 +1810,7 @@ class SemanticRuntime:
         ]
         poses = []
         for point in raw_points:
-            if not object_pose_fully_inside_box_region(
-                obj, point, goal, margin=GOAL_INTERIOR_MARGIN_M
-            ):
+            if not object_pose_fully_inside_box_region(obj, point, goal, margin=GOAL_INTERIOR_MARGIN_M):
                 continue
             if not self._clear_of_objects(point, occupied, DROP_CLEARANCE_M):
                 continue
@@ -2412,28 +1819,7 @@ class SemanticRuntime:
         poses.sort(key=lambda pose: self._goal_drop_score(obj, pose, goal, world))
         return poses
 
-    @staticmethod
-    def _clear_of_objects(
-        point: dict[str, float], objects: list[dict[str, Any]], clearance: float
-    ) -> bool:
-        """Return True when point is not too close to any currently occupied object.
-
-        SemanticRuntime also needs this helper because it generates object-aware
-        goal-drop candidates after the symbolic world has been built. The same
-        geometry rule is used by WorldModelBuilder when it precomputes safe pose
-        candidates.
-        """
-        return all(
-            xy_distance(point, obj["pose"]["position"]) >= clearance for obj in objects
-        )
-
-    def _goal_drop_score(
-        self,
-        obj: dict[str, Any],
-        candidate: dict[str, Any],
-        goal: dict[str, Any],
-        world: dict[str, Any],
-    ) -> float:
+    def _goal_drop_score(self, obj: dict[str, Any], candidate: dict[str, Any], goal: dict[str, Any], world: dict[str, Any]) -> float:
         p = candidate["position"]
         center = goal["center"]
         center_dist = xy_distance(p, center)
@@ -2441,14 +1827,9 @@ class SemanticRuntime:
         occupied = [
             other
             for other in world.get("objects", [])
-            if other.get("id") != obj.get("id")
-            and object_fully_inside_box_region(other, goal, margin=0.0)
+            if other.get("id") != obj.get("id") and object_fully_inside_box_region(other, goal, margin=0.0)
         ]
-        clearance = (
-            0.0
-            if not occupied
-            else min(xy_distance(p, other["pose"]["position"]) for other in occupied)
-        )
+        clearance = 0.0 if not occupied else min(xy_distance(p, other["pose"]["position"]) for other in occupied)
         return (
             GOAL_CENTER_BIAS_WEIGHT * center_dist
             + GOAL_TRAVEL_BIAS_WEIGHT * travel_dist
@@ -2462,36 +1843,24 @@ class SemanticRuntime:
         source_robots: list[str],
         destination_robots: list[str],
     ) -> dict[str, Any] | None:
-        candidates = list(
-            world.get("safe_pose_candidates", {}).get("handover_buffer", [])
-        )
+        candidates = list(world.get("safe_pose_candidates", {}).get("handover_buffer", []))
         # Add outside candidates as fallback handover buffers if the table center is not mutually reachable.
-        candidates.extend(
-            world.get("safe_pose_candidates", {}).get("outside_goals", [])[:10]
-        )
+        candidates.extend(world.get("safe_pose_candidates", {}).get("outside_goals", [])[:10])
         if not candidates:
             return None
         object_z = float(obj["pose"]["position"]["z"]) + BUFFER_Z_OFFSET_M
         for candidate in candidates:
             candidate = make_pose({**candidate["position"], "z": object_z})
-            if any(
-                self._robot_can_reach_pose(world, src, candidate)
-                for src in source_robots
-            ) and any(
-                self._robot_can_reach_pose(world, dst, candidate)
-                for dst in destination_robots
+            if any(self._robot_can_reach_pose(world, src, candidate) for src in source_robots) and any(
+                self._robot_can_reach_pose(world, dst, candidate) for dst in destination_robots
             ):
                 return candidate
         return None
 
-    def _decompose_task(
-        self, world: dict[str, Any], task: ObjectTask
-    ) -> list[PrimitiveDecision]:
+    def _decompose_task(self, world: dict[str, Any], task: ObjectTask) -> list[PrimitiveDecision]:
         obj = get_object(world, task.object_id)
         if obj is None:
-            raise RuntimeError(
-                f"Object disappeared before decomposition: {task.object_id}"
-            )
+            raise RuntimeError(f"Object disappeared before decomposition: {task.object_id}")
         route = task.route
         if route.route_type in {"direct", "direct_held"}:
             return self._decompose_direct(world, obj, route, task)
@@ -2499,169 +1868,24 @@ class SemanticRuntime:
             return self._decompose_handover(world, obj, route, task)
         raise RuntimeError(f"Unsupported route type: {route.route_type}")
 
-    def _safe_pre_pick_sequence(
-        self,
-        world: dict[str, Any],
-        robot_id: str,
-        obj: dict[str, Any],
-        task: ObjectTask,
-        pick_reason: str,
-    ) -> list[PrimitiveDecision]:
-        pick_position = dict(obj["pose"]["position"])
-        pick_position["z"] = (
-            float(pick_position.get("z", DEFAULT_TABLE_CENTER["z"])) + PICK_Z_OFFSET_M
-        )
-        object_pose = make_pose(pick_position)
-
-        # object_pose = make_pose(obj["pose"]["position"])
-
-        held_id = self.memory.held_objects.get(robot_id)
-        if held_id and held_id != obj["id"]:
-            raise RuntimeError(
-                f"{robot_id} cannot start pick/regrasp for {obj['id']} because it is already holding {held_id}. "
-                "Run release/home recovery or finish the held-object transaction first."
-            )
-
-        decisions: list[PrimitiveDecision] = []
-        if (
-            ENSURE_GRIPPER_OPEN_BEFORE_PICK
-            and not held_id
-            and not self.memory.gripper_is_open(robot_id)
-        ):
-            decisions.append(
-                self._decision(
-                    robot_id,
-                    ACTION_RELEASE,
-                    None,
-                    obj["id"],
-                    "ensure_gripper_open_before_pick",
-                    "Open gripper before pick/regrasp because gripper_state is not open.",
-                    task,
-                )
-            )
-
-        if not SAFE_PRE_PICK_ENABLED:
-            decisions.append(
-                self._decision(
-                    robot_id,
-                    ACTION_MOVING,
-                    object_pose,
-                    obj["id"],
-                    "pick",
-                    pick_reason,
-                    task,
-                )
-            )
-            return decisions
-
-        object_z = float(obj["pose"]["position"].get("z", DEFAULT_TABLE_CENTER["z"]))
-        safe_z = object_z + SAFE_Z_OFFSET_M
-        eef_pose = world.get("robots", {}).get(robot_id, {}).get("end_effector_pose")
-        if eef_pose and eef_pose.get("position"):
-            eef_pos = eef_pose["position"]
-            retreat_pos = {
-                "x": float(eef_pos.get("x", obj["pose"]["position"]["x"])),
-                "y": float(eef_pos.get("y", obj["pose"]["position"]["y"])),
-                "z": max(float(eef_pos.get("z", safe_z)), safe_z),
-            }
-            decisions.append(
-                self._decision(
-                    robot_id,
-                    ACTION_MOVING,
-                    make_pose(retreat_pos),
-                    obj["id"],
-                    "retreat_before_pick",
-                    "Raise vertically before pick/regrasp so the next XY move cannot push objects.",
-                    task,
-                )
-            )
-        approach_pos = dict(obj["pose"]["position"])
-        approach_pos["z"] = safe_z
-        decisions.append(
-            self._decision(
-                robot_id,
-                ACTION_MOVING,
-                make_pose(approach_pos),
-                obj["id"],
-                "pick_approach",
-                "Move above the object at safe clearance before descending to pick.",
-                task,
-            )
-        )
-        decisions.append(
-            self._decision(
-                robot_id,
-                ACTION_MOVING,
-                object_pose,
-                obj["id"],
-                "pick",
-                pick_reason,
-                task,
-            )
-        )
-        return decisions
-
-    def _decompose_direct(
-        self,
-        world: dict[str, Any],
-        obj: dict[str, Any],
-        route: RouteCandidate,
-        task: ObjectTask,
-    ) -> list[PrimitiveDecision]:
+    def _decompose_direct(self, world: dict[str, Any], obj: dict[str, Any], route: RouteCandidate, task: ObjectTask) -> list[PrimitiveDecision]:
         robot_id = route.source_robot_id
         object_pose = make_pose(obj["pose"]["position"])
         lift_pose = self._lift_pose(object_pose)
         approach_pose = self._approach_pose(route.drop_pose)
         decisions: list[PrimitiveDecision] = []
-        if (
-            obj.get("held_by") != robot_id
-            and self.memory.held_objects.get(robot_id) != obj["id"]
-        ):
+        if obj.get("held_by") != robot_id and self.memory.held_objects.get(robot_id) != obj["id"]:
             decisions.extend(
-                self._safe_pre_pick_sequence(
-                    world, robot_id, obj, task, "Move to the selected object pose."
-                )
-            )
-            decisions.append(
-                self._decision(
-                    robot_id,
-                    ACTION_GRIP,
-                    None,
-                    obj["id"],
-                    "grip",
-                    "Grip the selected object.",
-                    task,
-                )
+                [
+                    self._decision(robot_id, ACTION_MOVING, object_pose, obj["id"], "pick", "Move to the selected object pose.", task),
+                    self._decision(robot_id, ACTION_GRIP, None, obj["id"], "grip", "Grip the selected object.", task),
+                ]
             )
         decisions.extend(
             [
-                self._decision(
-                    robot_id,
-                    ACTION_MOVING,
-                    lift_pose,
-                    obj["id"],
-                    "lift",
-                    "Lift before horizontal transfer.",
-                    task,
-                ),
-                self._decision(
-                    robot_id,
-                    ACTION_MOVING,
-                    approach_pose,
-                    obj["id"],
-                    "drop_approach",
-                    "Move above destination pose.",
-                    task,
-                ),
-                self._decision(
-                    robot_id,
-                    ACTION_MOVING,
-                    route.drop_pose,
-                    obj["id"],
-                    "drop",
-                    "Lower to destination pose.",
-                    task,
-                ),
+                self._decision(robot_id, ACTION_MOVING, lift_pose, obj["id"], "lift", "Lift before horizontal transfer.", task),
+                self._decision(robot_id, ACTION_MOVING, approach_pose, obj["id"], "drop_approach", "Move above destination pose.", task),
+                self._decision(robot_id, ACTION_MOVING, route.drop_pose, obj["id"], "drop", "Lower to destination pose.", task),
                 self._decision(
                     robot_id,
                     ACTION_RELEASE,
@@ -2672,26 +1896,12 @@ class SemanticRuntime:
                     task,
                     verify=self._release_verify_metadata(task, route.drop_pose),
                 ),
-                self._decision(
-                    robot_id,
-                    ACTION_HOMING,
-                    None,
-                    obj["id"],
-                    "home",
-                    "Return robot home after release.",
-                    task,
-                ),
+                self._decision(robot_id, ACTION_HOMING, None, obj["id"], "home", "Return robot home after release.", task),
             ]
         )
         return decisions
 
-    def _decompose_handover(
-        self,
-        world: dict[str, Any],
-        obj: dict[str, Any],
-        route: RouteCandidate,
-        task: ObjectTask,
-    ) -> list[PrimitiveDecision]:
+    def _decompose_handover(self, world: dict[str, Any], obj: dict[str, Any], route: RouteCandidate, task: ObjectTask) -> list[PrimitiveDecision]:
         if route.buffer_pose is None:
             raise RuntimeError("Handover route lacks buffer_pose")
         src = route.source_robot_id
@@ -2702,173 +1912,50 @@ class SemanticRuntime:
         buffer_drop = route.buffer_pose
         dst_lift = self._lift_pose(buffer_drop)
         drop_approach = self._approach_pose(route.drop_pose)
-
-        decisions: list[PrimitiveDecision] = []
-        decisions.extend(
-            self._safe_pre_pick_sequence(
-                world, src, obj, task, "Source robot moves to object."
-            )
-        )
-        decisions.extend(
-            [
-                self._decision(
-                    src,
-                    ACTION_GRIP,
-                    None,
-                    obj["id"],
-                    "grip",
-                    "Source robot grips object.",
-                    task,
-                ),
-                self._decision(
-                    src,
-                    ACTION_MOVING,
-                    src_lift,
-                    obj["id"],
-                    "lift",
-                    "Source robot lifts object.",
-                    task,
-                ),
-                self._decision(
-                    src,
-                    ACTION_MOVING,
-                    buffer_approach,
-                    obj["id"],
-                    "buffer_approach",
-                    "Source robot moves above handover buffer.",
-                    task,
-                ),
-                self._decision(
-                    src,
-                    ACTION_MOVING,
-                    buffer_drop,
-                    obj["id"],
-                    "buffer_drop",
-                    "Source robot lowers to handover buffer.",
-                    task,
-                ),
-                self._decision(
-                    src,
-                    ACTION_RELEASE,
-                    None,
-                    obj["id"],
-                    "buffer_release",
-                    "Source robot releases object at handover buffer and verifies marker position.",
-                    task,
-                    verify={
-                        "type": "object_near_pose",
-                        "pose": buffer_drop,
-                        "object_id": obj["id"],
-                        "stage": "handover_buffer",
-                    },
-                ),
-                self._decision(
-                    src,
-                    ACTION_HOMING,
-                    None,
-                    obj["id"],
-                    "home",
-                    "Source robot homes after buffer release.",
-                    task,
-                ),
-            ]
-        )
-
-        # Destination regrasp from the handover buffer is also made collision-safe by
-        # retreating and approaching from above. Use the expected buffer pose as the
-        # temporary object pose for the pre-pick sequence.
-        buffer_obj = dict(obj)
-        buffer_obj["pose"] = buffer_drop
-        decisions.extend(
-            self._safe_pre_pick_sequence(
-                world,
-                dst,
-                buffer_obj,
+        return [
+            self._decision(src, ACTION_MOVING, object_pose, obj["id"], "pick", "Source robot moves to object.", task),
+            self._decision(src, ACTION_GRIP, None, obj["id"], "grip", "Source robot grips object.", task),
+            self._decision(src, ACTION_MOVING, src_lift, obj["id"], "lift", "Source robot lifts object.", task),
+            self._decision(src, ACTION_MOVING, buffer_approach, obj["id"], "buffer_approach", "Source robot moves above handover buffer.", task),
+            self._decision(src, ACTION_MOVING, buffer_drop, obj["id"], "buffer_drop", "Source robot lowers to handover buffer.", task),
+            self._decision(
+                src,
+                ACTION_RELEASE,
+                None,
+                obj["id"],
+                "buffer_release",
+                "Source robot releases object at handover buffer and verifies marker position.",
                 task,
-                "Destination robot moves to handover buffer object.",
-            )
-        )
-        decisions.extend(
-            [
-                self._decision(
-                    dst,
-                    ACTION_GRIP,
-                    None,
-                    obj["id"],
-                    "grip",
-                    "Destination robot grips handover object.",
-                    task,
-                ),
-                self._decision(
-                    dst,
-                    ACTION_MOVING,
-                    dst_lift,
-                    obj["id"],
-                    "lift",
-                    "Destination robot lifts object.",
-                    task,
-                ),
-                self._decision(
-                    dst,
-                    ACTION_MOVING,
-                    drop_approach,
-                    obj["id"],
-                    "drop_approach",
-                    "Destination robot moves above final destination.",
-                    task,
-                ),
-                self._decision(
-                    dst,
-                    ACTION_MOVING,
-                    route.drop_pose,
-                    obj["id"],
-                    "drop",
-                    "Destination robot lowers to final destination.",
-                    task,
-                ),
-                self._decision(
-                    dst,
-                    ACTION_RELEASE,
-                    None,
-                    obj["id"],
-                    "release",
-                    "Destination robot releases object at final destination and verifies marker state.",
-                    task,
-                    verify=self._release_verify_metadata(task, route.drop_pose),
-                ),
-                self._decision(
-                    dst,
-                    ACTION_HOMING,
-                    None,
-                    obj["id"],
-                    "home",
-                    "Destination robot homes after release.",
-                    task,
-                ),
-            ]
-        )
-        return decisions
+                verify={"type": "object_near_pose", "pose": buffer_drop, "object_id": obj["id"], "stage": "handover_buffer"},
+            ),
+            self._decision(src, ACTION_HOMING, None, obj["id"], "home", "Source robot homes after buffer release.", task),
+            self._decision(dst, ACTION_MOVING, buffer_drop, obj["id"], "pick", "Destination robot moves to handover buffer object.", task),
+            self._decision(dst, ACTION_GRIP, None, obj["id"], "grip", "Destination robot grips handover object.", task),
+            self._decision(dst, ACTION_MOVING, dst_lift, obj["id"], "lift", "Destination robot lifts object.", task),
+            self._decision(dst, ACTION_MOVING, drop_approach, obj["id"], "drop_approach", "Destination robot moves above final destination.", task),
+            self._decision(dst, ACTION_MOVING, route.drop_pose, obj["id"], "drop", "Destination robot lowers to final destination.", task),
+            self._decision(
+                dst,
+                ACTION_RELEASE,
+                None,
+                obj["id"],
+                "release",
+                "Destination robot releases object at final destination and verifies marker state.",
+                task,
+                verify=self._release_verify_metadata(task, route.drop_pose),
+            ),
+            self._decision(dst, ACTION_HOMING, None, obj["id"], "home", "Destination robot homes after release.", task),
+        ]
 
-    def _release_verify_metadata(
-        self, task: ObjectTask, pose: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _release_verify_metadata(self, task: ObjectTask, pose: dict[str, Any]) -> dict[str, Any]:
         destination = task.destination
         dest_type = destination["type"]
         if dest_type == "goal":
-            return {
-                "type": "object_in_region",
-                "object_id": task.object_id,
-                "region": f"{destination['goal_color']}_goal",
-            }
+            return {"type": "object_in_region", "object_id": task.object_id, "region": f"{destination['goal_color']}_goal"}
         if dest_type in {"outside_goals", "safe_free_space"}:
             return {"type": "object_outside_goals", "object_id": task.object_id}
         if dest_type in {"table_center", "handover_buffer"}:
-            return {
-                "type": "object_near_pose",
-                "object_id": task.object_id,
-                "pose": pose,
-                "stage": dest_type,
-            }
+            return {"type": "object_near_pose", "object_id": task.object_id, "pose": pose, "stage": dest_type}
         return {"type": "object_near_pose", "object_id": task.object_id, "pose": pose}
 
     def _decision(
@@ -2891,9 +1978,7 @@ class SemanticRuntime:
         }
         if verify:
             metadata["verify_after_action"] = verify
-        return PrimitiveDecision(
-            robot_id, action, pose, object_id, intent, reason, metadata=metadata
-        )
+        return PrimitiveDecision(robot_id, action, pose, object_id, intent, reason, metadata=metadata)
 
     def _lift_pose(self, pose: dict[str, Any]) -> dict[str, Any]:
         position = dict(pose["position"])
@@ -2905,48 +1990,27 @@ class SemanticRuntime:
         position["z"] = float(position["z"]) + SAFE_Z_OFFSET_M
         return make_pose(position)
 
-    def _robots_that_can_reach_pose(
-        self, world: dict[str, Any], pose: dict[str, Any]
-    ) -> list[str]:
-        candidates = [
-            robot_id
-            for robot_id in CONTROL_SERVICE_TOPICS
-            if self._robot_can_reach_pose(world, robot_id, pose)
-        ]
+    def _robots_that_can_reach_pose(self, world: dict[str, Any], pose: dict[str, Any]) -> list[str]:
+        candidates = [robot_id for robot_id in CONTROL_SERVICE_TOPICS if self._robot_can_reach_pose(world, robot_id, pose)]
         candidates.sort(key=lambda rid: self._robot_pose_distance(world, rid, pose))
         return candidates
 
-    def _robot_can_reach_pose(
-        self, world: dict[str, Any], robot_id: str, pose: dict[str, Any]
-    ) -> bool:
+    def _robot_can_reach_pose(self, world: dict[str, Any], robot_id: str, pose: dict[str, Any]) -> bool:
         robot = world.get("robots", {}).get(robot_id, {})
         base_pose = robot.get("base_pose")
         if not base_pose:
             return False
-        return xy_distance(base_pose["position"], pose["position"]) <= float(
-            robot.get("reach_radius", 0.0)
-        )
+        return xy_distance(base_pose["position"], pose["position"]) <= float(robot.get("reach_radius", 0.0))
 
-    def _robot_pose_distance(
-        self, world: dict[str, Any], robot_id: str, pose: dict[str, Any]
-    ) -> float:
+    def _robot_pose_distance(self, world: dict[str, Any], robot_id: str, pose: dict[str, Any]) -> float:
         robot = world.get("robots", {}).get(robot_id, {})
         base_pose = robot.get("base_pose")
         if not base_pose:
             return float("inf")
         return xy_distance(base_pose["position"], pose["position"])
 
-    def _route_score(
-        self,
-        world: dict[str, Any],
-        obj: dict[str, Any],
-        drop_pose: dict[str, Any],
-        src: str,
-        dst: str,
-    ) -> float:
-        return self._robot_pose_distance(
-            world, src, obj["pose"]
-        ) + self._robot_pose_distance(world, dst, drop_pose)
+    def _route_score(self, world: dict[str, Any], obj: dict[str, Any], drop_pose: dict[str, Any], src: str, dst: str) -> float:
+        return self._robot_pose_distance(world, src, obj["pose"]) + self._robot_pose_distance(world, dst, drop_pose)
 
 
 def get_object(world: dict[str, Any], object_id: str) -> dict[str, Any] | None:
@@ -2970,17 +2034,8 @@ def is_topdown_grasp_state_rejection(message: str) -> bool:
     """
     text = str(message or "").lower()
     grasp_terms = (
-        "held",
-        "holding",
-        "grasp",
-        "gripper",
-        "attached",
-        "carried",
-        "잡",
-        "쥐",
-        "들고",
-        "그리퍼",
-        "파지",
+        "held", "holding", "grasp", "gripper", "attached", "carried",
+        "잡", "쥐", "들고", "그리퍼", "파지",
     )
     return any(term in text for term in grasp_terms)
 
@@ -2989,20 +2044,13 @@ class VisualVerifier:
     def __init__(self, reporter: Reporter) -> None:
         self.reporter = reporter
 
-    def verify_predicate(
-        self, world: dict[str, Any], image_bytes: bytes, verify: dict[str, Any]
-    ) -> tuple[bool, str]:
+    def verify_predicate(self, world: dict[str, Any], image_bytes: bytes, verify: dict[str, Any]) -> tuple[bool, str]:
         if not USE_MULTIMODAL_VISUAL_VERIFICATION:
             return True, "visual verification disabled"
         prompt = self._predicate_prompt(world, verify)
         return self._call(prompt, image_bytes)
 
-    def verify_finish(
-        self,
-        world: dict[str, Any],
-        image_bytes: bytes,
-        conditions: list[SemanticGoalCondition],
-    ) -> tuple[bool, str]:
+    def verify_finish(self, world: dict[str, Any], image_bytes: bytes, conditions: list[SemanticGoalCondition]) -> tuple[bool, str]:
         if not USE_MULTIMODAL_VISUAL_VERIFICATION:
             return True, "visual finish verification disabled"
         prompt = self._finish_prompt(world, conditions)
@@ -3025,7 +2073,7 @@ class VisualVerifier:
                 "required_response": {
                     "success": "boolean",
                     "confidence": "number from 0 to 1",
-                    "reason": "short explanation",
+                    "reason": "short explanation"
                 },
             },
             ensure_ascii=False,
@@ -3033,9 +2081,7 @@ class VisualVerifier:
             sort_keys=True,
         )
 
-    def _finish_prompt(
-        self, world: dict[str, Any], conditions: list[SemanticGoalCondition]
-    ) -> str:
+    def _finish_prompt(self, world: dict[str, Any], conditions: list[SemanticGoalCondition]) -> str:
         return json.dumps(
             {
                 "role": "multimodal_finish_verifier",
@@ -3044,14 +2090,14 @@ class VisualVerifier:
                     "Use the top-view image only for visible 2D geometry: object footprint, goal/table regions, and relative placement. "
                     "Important limitation: the camera is top-down, so it cannot reliably determine gripper open/closed state or whether an object is held. "
                     "Do not use visual inspection to decide held/released state; that is handled separately by the symbolic execution state. "
-                    "Objects requested inside a goal are checked metrically by MarkerArray geometry first. Use the image only as an advisory sanity check for obvious contradictions, not as the exact boundary judge. Do not override passed marker geometry based on approximate visual boundary interpretation. Return JSON only."
+                    "Objects requested inside a goal must have their full visible footprint inside that goal, not on the border. Return JSON only."
                 ),
                 "goal_conditions": [condition.as_dict() for condition in conditions],
                 "world_model": self._compact_world(world),
                 "required_response": {
                     "success": "boolean",
                     "confidence": "number from 0 to 1",
-                    "reason": "short explanation",
+                    "reason": "short explanation"
                 },
             },
             ensure_ascii=False,
@@ -3110,60 +2156,38 @@ class VisualVerifier:
                 confidence = float(parsed.get("confidence", 0.0) or 0.0)
                 reason = str(parsed.get("reason") or "")
                 if success and confidence >= VISUAL_VERIFY_CONFIDENCE_THRESHOLD:
-                    return (
-                        True,
-                        f"visual verification passed confidence={confidence:.2f}: {reason}",
-                    )
-                return (
-                    False,
-                    f"visual verification rejected confidence={confidence:.2f}: {reason}",
-                )
+                    return True, f"visual verification passed confidence={confidence:.2f}: {reason}"
+                return False, f"visual verification rejected confidence={confidence:.2f}: {reason}"
             except Exception as exc:
                 errors.append(f"{mode}: {exc}")
                 if LLM_BACKEND != "auto":
                     break
         if REQUIRE_MULTIMODAL_VISUAL_VERIFICATION:
             return False, "visual verification unavailable: " + " | ".join(errors)
-        return True, "visual verification unavailable but not required: " + " | ".join(
-            errors
-        )
+        return True, "visual verification unavailable but not required: " + " | ".join(errors)
 
     def _call_openai(self, prompt: str, image_bytes: bytes) -> dict[str, Any]:
-        api_key = (
-            os.getenv("OPENAI_API_KEY") or os.getenv("CHATGPT_API_KEY") or ""
-        ).strip()
+        api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("CHATGPT_API_KEY") or "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY or CHATGPT_API_KEY is not set")
         payload = {
             "model": OPENAI_MODEL,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a strict multimodal robot-task verifier. Return JSON only.",
-                },
+                {"role": "system", "content": "You are a strict multimodal robot-task verifier. Return JSON only."},
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data_url(image_bytes)},
-                        },
+                        {"type": "image_url", "image_url": {"url": image_data_url(image_bytes)}},
                     ],
                 },
             ],
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
         }
-        response = post_json(
-            OPENAI_API_URL, payload, {"Authorization": f"Bearer {api_key}"}
-        )
+        response = post_json(OPENAI_API_URL, payload, {"Authorization": f"Bearer {api_key}"})
         choices = response.get("choices") or []
-        message = (
-            choices[0].get("message")
-            if choices and isinstance(choices[0], dict)
-            else {}
-        )
+        message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
         return extract_json_object(str((message or {}).get("content") or ""))
 
     def _call_ollama(self, prompt: str, image_bytes: bytes) -> dict[str, Any]:
@@ -3171,35 +2195,19 @@ class VisualVerifier:
             "model": OLLAMA_MODEL,
             "stream": False,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a strict multimodal robot-task verifier. Return JSON only.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                    "images": [base64.b64encode(image_bytes).decode("utf-8")],
-                },
+                {"role": "system", "content": "You are a strict multimodal robot-task verifier. Return JSON only."},
+                {"role": "user", "content": prompt, "images": [base64.b64encode(image_bytes).decode("utf-8")]},
             ],
             "format": "json",
             "options": {"temperature": 0.0},
         }
         response = post_json(OLLAMA_URL, payload, {})
         msg = response.get("message") or {}
-        return extract_json_object(
-            str(msg.get("content") or response.get("response") or "")
-        )
+        return extract_json_object(str(msg.get("content") or response.get("response") or ""))
 
 
 class Executor:
-    def __init__(
-        self,
-        node: RosWorldNode,
-        memory: ExecutionMemory,
-        builder: WorldModelBuilder,
-        reporter: Reporter,
-        visual_verifier: VisualVerifier,
-    ) -> None:
+    def __init__(self, node: RosWorldNode, memory: ExecutionMemory, builder: WorldModelBuilder, reporter: Reporter, visual_verifier: VisualVerifier) -> None:
         self.node = node
         self.memory = memory
         self.builder = builder
@@ -3213,63 +2221,35 @@ class Executor:
             return result
 
         if decision.robot_id not in CONTROL_SERVICE_TOPICS:
-            result = ExecutionResult(
-                False, f"Invalid robot_id: {decision.robot_id}", decision
-            )
+            result = ExecutionResult(False, f"Invalid robot_id: {decision.robot_id}", decision)
             self.memory.append_result(result)
             return result
         if decision.action not in ALLOWED_PRIMITIVE_ACTIONS:
-            result = ExecutionResult(
-                False, f"Invalid primitive action: {decision.action}", decision
-            )
+            result = ExecutionResult(False, f"Invalid primitive action: {decision.action}", decision)
             self.memory.append_result(result)
             return result
 
         if DRY_RUN:
             success, message = True, "dry-run: ROS service call skipped"
         else:
-            success, message = self.node.call_control_service(
-                decision.robot_id, decision.action, decision.target_pose
-            )
+            success, message = self.node.call_control_service(decision.robot_id, decision.action, decision.target_pose)
         result = ExecutionResult(success, message, decision)
-        service_accepted = bool(result.success)
-        if service_accepted:
-            self._update_gripper_command_state(decision)
 
-        if (
-            result.success
-            and decision.action == ACTION_MOVING
-            and decision.target_pose is not None
-            and not DRY_RUN
-        ):
-            arrived = self.node.wait_for_eef_target(
-                decision.robot_id, decision.target_pose, MOTION_TIMEOUT_SEC
-            )
+        if result.success and decision.action == ACTION_MOVING and decision.target_pose is not None and not DRY_RUN:
+            arrived = self.node.wait_for_eef_target(decision.robot_id, decision.target_pose, MOTION_TIMEOUT_SEC)
             if not arrived:
-                result = ExecutionResult(
-                    False,
-                    f"{result.message}; EEF did not reach target before timeout",
-                    decision,
-                )
+                result = ExecutionResult(False, f"{result.message}; EEF did not reach target before timeout", decision)
         elif result.success and not DRY_RUN:
             self._settle(SETTLE_SEC)
 
         if result.success:
             verified, verification_message = self._verify_after_action(decision)
             if not verified:
-                result = ExecutionResult(
-                    False,
-                    f"{result.message}; verification failed: {verification_message}",
-                    decision,
-                )
+                result = ExecutionResult(False, f"{result.message}; verification failed: {verification_message}", decision)
             else:
                 if verification_message:
-                    result = ExecutionResult(
-                        True, f"{result.message}; {verification_message}", decision
-                    )
+                    result = ExecutionResult(True, f"{result.message}; {verification_message}", decision)
 
-        if not result.success:
-            self._reconcile_failed_action(decision, result.message)
         self._update_holding_state(decision, result.success)
         self.memory.append_result(result)
         return result
@@ -3279,192 +2259,30 @@ class Executor:
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(self.node, timeout_sec=0.05)
 
-    def _reconcile_failed_action(
-        self, decision: PrimitiveDecision, message: str
-    ) -> None:
-        robot_id = str(decision.robot_id)
-        object_id = decision.target_object_id
-        if not object_id or robot_id not in self.memory.held_objects:
-            return
-        if (
-            decision.action == ACTION_MOVING
-            and decision.intent == "lift"
-            and self.memory.pending_grip_targets.get(robot_id) == object_id
-        ):
-            self.memory.pending_grip_targets[robot_id] = None
-            self.memory.held_objects[robot_id] = None
-            self.memory.last_verification = {
-                "ok": False,
-                "message": f"grasp/lift failed for {object_id}; cleared pending held state",
-                "time": time.time(),
-            }
-            return
-        if decision.action != ACTION_RELEASE:
-            return
-
-        # Release verification can fail because the object was never actually held.
-        # If the marker is far from both the target/drop pose and the current EEF, treat
-        # this as a false-held state and clear it so the runtime replans from reality.
-        try:
-            raw, _image_bytes = self.node.snapshot_raw()
-            world = self.builder.build(raw)
-        except Exception:
-            return
-        obj = get_object(world, object_id)
-        robot = world.get("robots", {}).get(robot_id, {})
-        eef_pose = robot.get("end_effector_pose")
-        if obj is None or not eef_pose or not eef_pose.get("position"):
-            return
-        obj_pos = obj["pose"]["position"]
-        eef_dist = xy_distance(obj_pos, eef_pose["position"])
-        verify = (
-            decision.metadata.get("verify_after_action") if decision.metadata else {}
-        )
-        target_dist = float("inf")
-        if isinstance(verify, dict) and isinstance(verify.get("pose"), dict):
-            target_dist = xy_distance(obj_pos, verify["pose"]["position"])
-        elif decision.target_pose and decision.target_pose.get("position"):
-            target_dist = xy_distance(obj_pos, decision.target_pose["position"])
-        if (
-            eef_dist > GRASP_FALSE_HELD_EEF_DISTANCE_M
-            and target_dist > VERIFY_XY_TOLERANCE_M
-        ):
-            self.memory.held_objects[robot_id] = None
-            self.memory.pending_grip_targets[robot_id] = None
-            self.memory.last_verification = {
-                "ok": False,
-                "message": (
-                    f"false-held reconciliation: {robot_id} was believed to hold {object_id}, "
-                    f"but marker is far from EEF/drop target after release failure "
-                    f"(eef_dist={eef_dist:.3f}, target_dist={target_dist:.3f}); cleared held state"
-                ),
-                "time": time.time(),
-            }
-
     def _verify_after_action(self, decision: PrimitiveDecision) -> tuple[bool, str]:
-        verify = (
-            decision.metadata.get("verify_after_action") if decision.metadata else None
-        )
+        verify = decision.metadata.get("verify_after_action") if decision.metadata else None
         if not verify:
-            if self._needs_grasp_follow_verification(decision):
-                time.sleep(VERIFY_DELAY_SEC)
-                raw, _image_bytes = self.node.snapshot_raw()
-                world = self.builder.build(raw)
-                return self._verify_grasp_following_eef(world, decision)
             return True, ""
         time.sleep(VERIFY_DELAY_SEC)
         raw, image_bytes = self.node.snapshot_raw()
         world = self.builder.build(raw)
-        # First run the strict marker/geometry predicate. This is the authoritative metric check.
         ok, message = verify_predicate(world, verify)
         if ok and self._needs_visual_verification(verify):
-            visual_ok, visual_message = self.visual_verifier.verify_predicate(
-                world, image_bytes, verify
-            )
+            visual_ok, visual_message = self.visual_verifier.verify_predicate(world, image_bytes, verify)
             if not visual_ok and is_topdown_grasp_state_rejection(visual_message):
+                visual_ok = True
                 visual_message = (
-                    "visual advisory rejection was ignored because it was based on grasp/held state, "
-                    "which is not observable from the top-down camera: "
-                    + visual_message
+                    "visual verification rejection was ignored because it was based on grasp/held state, "
+                    "which is not observable from the top-down camera: " + visual_message
                 )
-            elif not visual_ok and not VISUAL_VERIFICATION_CAN_VETO_MARKER_SUCCESS:
-                visual_message = (
-                    "visual advisory rejection was ignored because strict MarkerArray geometry already passed: "
-                    + visual_message
-                )
-            else:
-                # This branch is kept for optional future stricter modes.
-                ok = visual_ok
+            ok = visual_ok
             message = f"{message}; {visual_message}"
-        self.memory.last_verification = {
-            "ok": ok,
-            "message": message,
-            "verify": verify,
-            "time": time.time(),
-        }
+        self.memory.last_verification = {"ok": ok, "message": message, "verify": verify, "time": time.time()}
         return ok, message
 
     @staticmethod
     def _needs_visual_verification(verify: dict[str, Any]) -> bool:
-        return verify.get("type") in {
-            "object_in_region",
-            "object_outside_goals",
-            "object_near_pose",
-        }
-
-    def _needs_grasp_follow_verification(self, decision: PrimitiveDecision) -> bool:
-        if not CONFIRM_GRASP_AFTER_LIFT:
-            return False
-        if decision.action != ACTION_MOVING or decision.intent != "lift":
-            return False
-        robot_id = str(decision.robot_id)
-        target_id = decision.target_object_id
-        return bool(
-            target_id and self.memory.pending_grip_targets.get(robot_id) == target_id
-        )
-
-    def _verify_grasp_following_eef(
-        self, world: dict[str, Any], decision: PrimitiveDecision
-    ) -> tuple[bool, str]:
-        robot_id = str(decision.robot_id)
-        object_id = str(decision.target_object_id)
-        obj = get_object(world, object_id)
-        robot = world.get("robots", {}).get(robot_id, {})
-        eef_pose = robot.get("end_effector_pose")
-        if obj is None:
-            return (
-                False,
-                f"grasp confirmation failed: object {object_id} is not visible after lift",
-            )
-        if not eef_pose or not eef_pose.get("position"):
-            return (
-                False,
-                f"grasp confirmation failed: EEF pose for {robot_id} is unavailable",
-            )
-        obj_pos = obj["pose"]["position"]
-        eef_pos = eef_pose["position"]
-        xy_error = xy_distance(obj_pos, eef_pos)
-        z_error = abs(float(obj_pos.get("z", 0.0)) - float(eef_pos.get("z", 0.0)))
-        target_z_error = 0.0
-        if decision.target_pose and decision.target_pose.get("position"):
-            target_z_error = abs(
-                float(obj_pos.get("z", 0.0))
-                - float(decision.target_pose["position"].get("z", 0.0))
-            )
-        # The held marker may be offset from the EEF in Z by gripper/object geometry,
-        # so accept either EEF-Z proximity or proximity to the commanded lifted target Z.
-        z_ok = (
-            z_error <= GRASP_FOLLOW_Z_TOLERANCE_M
-            or target_z_error <= GRASP_FOLLOW_Z_TOLERANCE_M
-        )
-        if xy_error <= GRASP_FOLLOW_XY_TOLERANCE_M and z_ok:
-            return True, (
-                f"grasp confirmed after lift: object {object_id} follows {robot_id} EEF "
-                f"(xy_error={xy_error:.3f}, z_error={z_error:.3f}, target_z_error={target_z_error:.3f})"
-            )
-        self.memory.pending_grip_targets[robot_id] = None
-        self.memory.held_objects[robot_id] = None
-        return False, (
-            f"grasp confirmation failed after lift: object {object_id} did not follow {robot_id} EEF "
-            f"(xy_error={xy_error:.3f}, z_error={z_error:.3f}, target_z_error={target_z_error:.3f}); "
-            "cleared pending/held state to avoid ghost-holding"
-        )
-
-    def _update_gripper_command_state(self, decision: PrimitiveDecision) -> None:
-        """Update gripper command-state from accepted service calls.
-
-        This is intentionally independent of post-action object verification. For example,
-        a Realease command can open the physical gripper even if the object later fails to
-        verify inside the target region. Conversely, a Grip command closes the gripper but
-        does not prove the object is held; held state is confirmed only after lift.
-        """
-        robot_id = str(decision.robot_id)
-        if robot_id not in self.memory.gripper_states:
-            return
-        if decision.action == ACTION_GRIP:
-            self.memory.set_gripper_state(robot_id, GRIPPER_CLOSED)
-        elif decision.action == ACTION_RELEASE:
-            self.memory.set_gripper_state(robot_id, GRIPPER_OPEN)
+        return verify.get("type") in {"object_in_region", "object_outside_goals", "object_near_pose"}
 
     def _update_holding_state(self, decision: PrimitiveDecision, success: bool) -> None:
         if decision.robot_id not in self.memory.held_objects:
@@ -3472,33 +2290,13 @@ class Executor:
         robot_id = str(decision.robot_id)
         if not success:
             return
-
-        # Any non-homing primitive means the robot should not be considered safely homed
-        # for final verification. Homing itself is the only action that sets this true.
-        if decision.action == ACTION_HOMING:
-            self.memory.robots_homed[robot_id] = True
-            return
-        self.memory.robots_homed[robot_id] = False
-
         if decision.action == ACTION_MOVING and decision.intent == "pick":
             self.memory.pending_grip_targets[robot_id] = decision.target_object_id
         elif decision.action == ACTION_GRIP:
-            # A successful Grip service response only confirms the command was accepted.
-            # Do not mark the object held until the following lift proves the marker follows.
-            self.memory.pending_grip_targets[robot_id] = (
-                decision.target_object_id
-                or self.memory.pending_grip_targets.get(robot_id)
-            )
-        elif decision.action == ACTION_MOVING and decision.intent == "lift":
-            if (
-                decision.target_object_id
-                and self.memory.pending_grip_targets.get(robot_id)
-                == decision.target_object_id
-            ):
-                self.memory.held_objects[robot_id] = decision.target_object_id
-                self.memory.pending_grip_targets[robot_id] = None
+            self.memory.held_objects[robot_id] = decision.target_object_id or self.memory.pending_grip_targets.get(robot_id)
+            self.memory.pending_grip_targets[robot_id] = None
         elif decision.action == ACTION_RELEASE:
-            # Only clear after release succeeded and post-action marker verification passed.
+            # Only clear after release succeeded and post-action verification passed.
             self.memory.held_objects[robot_id] = None
             self.memory.pending_grip_targets[robot_id] = None
 
@@ -3527,9 +2325,6 @@ class Executor:
         for robot_id in self.memory.held_objects:
             self.memory.held_objects[robot_id] = None
             self.memory.pending_grip_targets[robot_id] = None
-            self.memory.set_gripper_state(robot_id, GRIPPER_OPEN)
-            self.memory.robots_homed[robot_id] = True
-        self.memory.reset_all_task_failures()
         self.memory.last_verification = {
             "ok": True,
             "message": "emergency release/home executed; internal held state reset",
@@ -3539,14 +2334,7 @@ class Executor:
 
 
 class FinishVerifier:
-    def __init__(
-        self,
-        node: RosWorldNode,
-        memory: ExecutionMemory,
-        builder: WorldModelBuilder,
-        runtime: SemanticRuntime,
-        visual_verifier: VisualVerifier,
-    ) -> None:
+    def __init__(self, node: RosWorldNode, memory: ExecutionMemory, builder: WorldModelBuilder, runtime: SemanticRuntime, visual_verifier: VisualVerifier) -> None:
         self.node = node
         self.memory = memory
         self.builder = builder
@@ -3555,28 +2343,9 @@ class FinishVerifier:
 
     def is_complete(self) -> tuple[bool, str]:
         if any(self.memory.held_objects.values()):
-            return (
-                False,
-                f"robot is still holding object(s): {self.memory.held_objects}",
-            )
+            return False, f"robot is still holding object(s): {self.memory.held_objects}"
         if any(self.memory.pending_grip_targets.values()):
-            return (
-                False,
-                f"pending grip target remains: {self.memory.pending_grip_targets}",
-            )
-        if not self.memory.all_grippers_open():
-            return (
-                False,
-                f"final verification requires all grippers open; not_open={self.memory.grippers_not_open()}, gripper_states={self.memory.gripper_states}",
-            )
-        if (
-            FINAL_VERIFY_REQUIRES_ALL_ROBOTS_HOMED
-            and not self.memory.all_robots_homed()
-        ):
-            return (
-                False,
-                f"final verification requires both robots homed first; not_homed={self.memory.robots_not_homed()}, homed_state={self.memory.robots_homed}",
-            )
+            return False, f"pending grip target remains: {self.memory.pending_grip_targets}"
         if not self.runtime.concrete_goal_conditions:
             return False, "no concrete goal conditions are available"
 
@@ -3586,9 +2355,7 @@ class FinishVerifier:
         for check_idx in range(FINISH_VERIFY_CHECKS):
             raw, image_bytes = self.node.snapshot_raw()
             world = self.builder.build(raw)
-            ok, message = verify_goal_conditions(
-                world, self.runtime.concrete_goal_conditions
-            )
+            ok, message = verify_goal_conditions(world, self.runtime.concrete_goal_conditions)
             if not ok:
                 return False, message
             last_message = message
@@ -3597,54 +2364,32 @@ class FinishVerifier:
             if check_idx + 1 < FINISH_VERIFY_CHECKS:
                 time.sleep(FINISH_VERIFY_INTERVAL_SEC)
         if last_world is not None and last_image_bytes is not None:
-            visual_ok, visual_message = self.visual_verifier.verify_finish(
-                last_world, last_image_bytes, self.runtime.concrete_goal_conditions
-            )
+            visual_ok, visual_message = self.visual_verifier.verify_finish(last_world, last_image_bytes, self.runtime.concrete_goal_conditions)
             if not visual_ok and is_topdown_grasp_state_rejection(visual_message):
+                visual_ok = True
                 visual_message = (
-                    "visual finish advisory rejection was ignored because it was based on grasp/held state, "
-                    "which is not observable from the top-down camera: "
-                    + visual_message
+                    "visual finish rejection was ignored because it was based on grasp/held state, "
+                    "which is not observable from the top-down camera: " + visual_message
                 )
-            elif (
-                not visual_ok and not FINAL_VISUAL_VERIFICATION_CAN_VETO_MARKER_SUCCESS
-            ):
-                visual_message = (
-                    "visual finish advisory rejection was ignored because strict fresh MarkerArray geometry checks already passed: "
-                    + visual_message
-                )
-            elif not visual_ok:
+            if not visual_ok:
                 return False, visual_message
             last_message = f"{last_message}; {visual_message}"
-        return (
-            True,
-            f"finish verified after both robots homed by {FINISH_VERIFY_CHECKS} fresh marker checks; multimodal visual check was advisory: {last_message}",
-        )
+        return True, f"finish verified by {FINISH_VERIFY_CHECKS} fresh marker checks plus multimodal visual verification: {last_message}"
 
 
-def verify_goal_conditions(
-    world: dict[str, Any], conditions: list[SemanticGoalCondition]
-) -> tuple[bool, str]:
+def verify_goal_conditions(world: dict[str, Any], conditions: list[SemanticGoalCondition]) -> tuple[bool, str]:
     for condition in conditions:
         for object_id in condition.object_ids:
             obj = get_object(world, object_id)
             if obj is None:
                 return False, f"object missing during finish verification: {object_id}"
             if obj.get("held_by"):
-                return (
-                    False,
-                    f"object {object_id} is still held by {obj.get('held_by')}",
-                )
+                return False, f"object {object_id} is still held by {obj.get('held_by')}"
             if condition.condition_type == "objects_in_goal":
                 goal = world.get("regions", {}).get(str(condition.required_region))
                 if not goal:
-                    return (
-                        False,
-                        f"goal region missing during finish verification: {condition.required_region}",
-                    )
-                if not object_fully_inside_box_region(
-                    obj, goal, margin=GOAL_INTERIOR_MARGIN_M
-                ):
+                    return False, f"goal region missing during finish verification: {condition.required_region}"
+                if not object_fully_inside_box_region(obj, goal, margin=GOAL_INTERIOR_MARGIN_M):
                     return False, (
                         f"object {object_id} is not fully inside {condition.required_region} "
                         f"with margin={GOAL_INTERIOR_MARGIN_M:.3f}; observed_region={obj.get('current_region')}, "
@@ -3652,31 +2397,17 @@ def verify_goal_conditions(
                     )
             elif condition.condition_type == "objects_outside_goals":
                 if obj.get("current_region") in {"red_goal", "blue_goal"}:
-                    return (
-                        False,
-                        f"object {object_id} is still inside {obj.get('current_region')}, expected outside_goals",
-                    )
+                    return False, f"object {object_id} is still inside {obj.get('current_region')}, expected outside_goals"
             elif condition.condition_type == "objects_near_region_pose":
-                region = world.get("regions", {}).get(
-                    str(condition.required_region), {}
-                )
+                region = world.get("regions", {}).get(str(condition.required_region), {})
                 pose = region.get("pose")
                 if not pose:
                     return False, f"region {condition.required_region} has no pose"
-                if (
-                    xy_distance(obj["pose"]["position"], pose["position"])
-                    > VERIFY_XY_TOLERANCE_M
-                ):
-                    return (
-                        False,
-                        f"object {object_id} is not near {condition.required_region}",
-                    )
+                if xy_distance(obj["pose"]["position"], pose["position"]) > VERIFY_XY_TOLERANCE_M:
+                    return False, f"object {object_id} is not near {condition.required_region}"
             else:
                 return False, f"unknown goal condition type: {condition.condition_type}"
-    return (
-        True,
-        f"all {len(conditions)} semantic goal condition(s) are satisfied and no object is held",
-    )
+    return True, f"all {len(conditions)} semantic goal condition(s) are satisfied and no object is held"
 
 
 def verify_predicate(world: dict[str, Any], verify: dict[str, Any]) -> tuple[bool, str]:
@@ -3690,20 +2421,14 @@ def verify_predicate(world: dict[str, Any], verify: dict[str, Any]) -> tuple[boo
         goal = world.get("regions", {}).get(region)
         if goal and goal.get("type") == "goal":
             if object_fully_inside_box_region(obj, goal, margin=GOAL_INTERIOR_MARGIN_M):
-                return (
-                    True,
-                    f"verified: object {object_id} is fully inside {region} with margin={GOAL_INTERIOR_MARGIN_M:.3f}",
-                )
+                return True, f"verified: object {object_id} is fully inside {region} with margin={GOAL_INTERIOR_MARGIN_M:.3f}"
             return False, (
                 f"object {object_id} is not fully inside {region}; "
                 f"observed_region={obj.get('current_region')}, pose={obj.get('pose', {}).get('position')}, scale={obj.get('scale')}"
             )
         if obj.get("current_region") == region:
             return True, f"verified: object {object_id} is in {region}"
-        return (
-            False,
-            f"object {object_id} is in {obj.get('current_region')}, expected {region}",
-        )
+        return False, f"object {object_id} is in {obj.get('current_region')}, expected {region}"
     if vtype == "object_outside_goals":
         if obj.get("current_region") not in {"red_goal", "blue_goal"}:
             return True, f"verified: object {object_id} is outside all goals"
@@ -3714,15 +2439,9 @@ def verify_predicate(world: dict[str, Any], verify: dict[str, Any]) -> tuple[boo
             return False, "object_near_pose verification lacks pose"
         pos = pose["position"]
         obj_pos = obj["pose"]["position"]
-        if (
-            xy_distance(obj_pos, pos) <= VERIFY_XY_TOLERANCE_M
-            and abs(float(obj_pos["z"]) - float(pos["z"])) <= VERIFY_Z_TOLERANCE_M
-        ):
+        if xy_distance(obj_pos, pos) <= VERIFY_XY_TOLERANCE_M and abs(float(obj_pos["z"]) - float(pos["z"])) <= VERIFY_Z_TOLERANCE_M:
             return True, f"verified: object {object_id} is near expected pose"
-        return (
-            False,
-            f"object {object_id} is not near expected pose; observed={obj_pos}, expected={pos}",
-        )
+        return False, f"object {object_id} is not near expected pose; observed={obj_pos}, expected={pos}"
     return False, f"unknown verification type: {vtype}"
 
 
@@ -3741,9 +2460,7 @@ def wait_for_ready(node: RosWorldNode, reporter: Reporter) -> None:
         now = time.monotonic()
         if now - last_report >= 3.0:
             waiting = [key for key, ready in readiness.items() if not ready]
-            reporter.status(
-                "Waiting for ROS2 observations", {"missing": ", ".join(waiting)}
-            )
+            reporter.status("Waiting for ROS2 observations", {"missing": ", ".join(waiting)})
             last_report = now
 
 
@@ -3805,7 +2522,6 @@ def run() -> int:
             "dry_run": DRY_RUN,
             "command": command,
             "reach_rule": f"XY distance <= {REACH_RADIUS_TABLE_SCALE:.2f} * table major length",
-            "initial_gripper_state": "both grippers are assumed open at program start",
             "max_steps": MAX_STEPS,
         },
     )
@@ -3832,21 +2548,14 @@ def run() -> int:
         reporter.status(
             "Initial symbolic world",
             {
-                "objects": [
-                    f"{obj['id']}({obj['color']},{obj['shape']},{obj['current_region']})"
-                    for obj in world["objects"]
-                ],
+                "objects": [f"{obj['id']}({obj['color']},{obj['shape']},{obj['current_region']})" for obj in world["objects"]],
                 "reachable_regions": world["summary"].get("reachable_regions"),
                 "held": memory.held_objects,
-                "grippers": memory.gripper_states,
-                "robots_homed": memory.robots_homed,
             },
         )
 
         try:
-            plan = request_llm_plan_with_validation(
-                llm, validator, command, world, image_bytes, feedback, reporter
-            )
+            plan = request_llm_plan_with_validation(llm, validator, command, world, image_bytes, feedback, reporter)
         except Exception as exc:
             reporter.error(f"Unable to obtain an executable semantic plan: {exc}")
             return 1
@@ -3863,8 +2572,6 @@ def run() -> int:
                     "step": step,
                     "objects_by_region": world["summary"].get("objects_by_region"),
                     "held": memory.held_objects,
-                    "grippers": memory.gripper_states,
-                    "robots_homed": memory.robots_homed,
                     "active_object": runtime.active_object_id,
                     "queued_primitives": len(runtime.primitive_queue),
                 },
@@ -3884,9 +2591,7 @@ def run() -> int:
                 )
                 reporter.error(feedback)
                 try:
-                    plan = request_llm_plan_with_validation(
-                        llm, validator, command, world, image_bytes, feedback, reporter
-                    )
+                    plan = request_llm_plan_with_validation(llm, validator, command, world, image_bytes, feedback, reporter)
                     runtime.load_plan(plan, world)
                     reporter.status("Replanned semantic plan", plan.as_dict())
                     decision = runtime.next_decision(world)
@@ -3898,15 +2603,10 @@ def run() -> int:
                 complete, finish_msg = finish_verifier.is_complete()
                 if complete:
                     result = executor.execute(decision)
-                    reporter.status(
-                        "Execution result",
-                        {"success": result.success, "message": result.message},
-                    )
+                    reporter.status("Execution result", {"success": result.success, "message": result.message})
                     reporter.info(finish_msg)
                     return 0
-                reporter.error(
-                    f"Finish was proposed but verifier rejected it: {finish_msg}"
-                )
+                reporter.error(f"Finish was proposed but verifier rejected it: {finish_msg}")
                 consecutive_failures += 1
                 if consecutive_failures >= CONSECUTIVE_FAILURE_EMERGENCY_THRESHOLD:
                     reporter.error(
@@ -3929,53 +2629,38 @@ def run() -> int:
 
             reporter.primitive(step, decision, len(runtime.primitive_queue))
             result = executor.execute(decision)
-            reporter.status(
-                "Execution result",
-                {"success": result.success, "message": result.message},
-            )
+            reporter.status("Execution result", {"success": result.success, "message": result.message})
             if result.success:
                 consecutive_failures = 0
-                memory.reset_task_failure(decision)
             if not result.success:
                 consecutive_failures += 1
-                task_failure_count = memory.record_task_failure(decision)
-                if (
-                    consecutive_failures >= CONSECUTIVE_FAILURE_EMERGENCY_THRESHOLD
-                    or task_failure_count >= TASK_FAILURE_EMERGENCY_THRESHOLD
-                ):
+                if consecutive_failures >= CONSECUTIVE_FAILURE_EMERGENCY_THRESHOLD:
                     reporter.error(
-                        f"Failure threshold reached (consecutive={consecutive_failures}, "
-                        f"task_key_count={task_failure_count}). Running emergency Realease + Homing for all robots."
+                        f"Consecutive failure threshold reached ({consecutive_failures}). "
+                        "Running emergency Realease + Homing for all robots."
                     )
                     for line in executor.emergency_release_and_home_all():
                         reporter.info(line)
                     runtime.clear_plan()
                     consecutive_failures = 0
-                    memory.reset_all_task_failures()
                     feedback = (
-                        "Emergency recovery was executed after repeated primitive/task-level failures. "
+                        "Emergency recovery was executed after repeated primitive failures. "
                         "All grippers were opened and all robots were homed; internal held state was reset. "
-                        "Use the current fresh world model to continue only if the locked initial task goal conditions remain unsatisfied. "
-                        "Do not expand the task to objects outside the initial locked target set."
+                        "Use the current fresh world model to continue only if task goal conditions remain unsatisfied."
                     )
                     continue
                 feedback = (
                     "The previous primitive execution failed. "
                     f"decision={decision}, message={result.message}, runtime_state={memory.as_llm_context()}. "
-                    "Use the updated symbolic world model and choose a corrected semantic plan. "
-                    "The runtime keeps the initial task object set and destinations locked; do not add unrelated objects."
+                    "Use the updated symbolic world model and choose a corrected semantic plan."
                 )
                 runtime.clear_plan()
                 try:
                     raw, image_bytes = node.snapshot_raw()
                     world = builder.build(raw)
-                    plan = request_llm_plan_with_validation(
-                        llm, validator, command, world, image_bytes, feedback, reporter
-                    )
+                    plan = request_llm_plan_with_validation(llm, validator, command, world, image_bytes, feedback, reporter)
                     runtime.load_plan(plan, world)
-                    reporter.status(
-                        "Replanned semantic plan after failure", plan.as_dict()
-                    )
+                    reporter.status("Replanned semantic plan after failure", plan.as_dict())
                 except Exception as exc:
                     reporter.error(f"Unable to recover after primitive failure: {exc}")
                     return 1
