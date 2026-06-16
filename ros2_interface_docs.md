@@ -139,7 +139,7 @@ Valid `action` strings are exact and case-sensitive:
 | `Centering` | Yes | Move end-effector to the table center pose |
 | `Placing` | Yes | Move end-effector to the robot-specific goal region |
 | `Grip` | No | Close gripper |
-| `Realease` | No | Open gripper. Note the spelling is intentionally currently `Realease` in code |
+| `Release` | No | Open gripper. Note the spelling is intentionally currently `Release` in code |
 | `Homing` | No | Return arm to home pose without changing gripper state |
 
 Movement behavior for `Moving`, `Centering`, and `Placing`:

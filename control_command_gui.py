@@ -48,7 +48,7 @@ ACTION_MOVING = "Moving"
 ACTION_CENTERING = "Centering"
 ACTION_PLACING = "Placing"
 ACTION_GRIP = "Grip"
-ACTION_REALEASE = "Realease"
+ACTION_RELEASE = "Release"
 ACTION_HOMING = "Homing"
 
 
@@ -181,7 +181,7 @@ class ControlCommandGui:
         ttk.Button(
             button_bar,
             text="Release",
-            command=lambda: self.send_simple(ACTION_REALEASE),
+            command=lambda: self.send_simple(ACTION_RELEASE),
         ).grid(row=0, column=4, sticky="ew", padx=6)
         ttk.Button(
             button_bar, text="Home", command=lambda: self.send_simple(ACTION_HOMING)

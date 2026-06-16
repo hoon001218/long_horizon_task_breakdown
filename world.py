@@ -23,9 +23,9 @@ import time
 from dataclasses import dataclass
 
 # Object count controls.
-NUM_CUBES = 2
-NUM_CAPSULES = 1
-NUM_SPHERES = 1
+NUM_CUBES = 5
+NUM_CAPSULES = 0
+NUM_SPHERES = 0
 OBJECT_SIZE_SCALE = 0.5
 OBJECT_SPAWN_DELAY_SEC = 1.0
 
@@ -63,7 +63,7 @@ ACTION_MOVING = "Moving"
 ACTION_CENTERING = "Centering"
 ACTION_PLACING = "Placing"
 ACTION_GRIP = "Grip"
-ACTION_REALEASE = "Realease"
+ACTION_REALEASE = "Release"
 ACTION_HOMING = "Homing"
 
 CONTROL_MODE = "auto"  # "manual" or "auto"
@@ -1796,6 +1796,9 @@ class AutoController(BaseController):
         )
         self.motion_phases: list[MotionPhase] = []
         self.phase_dwell_until: float | None = None
+        self.gripper_target_positions = np.array(
+            GRIPPER_OPEN_POSITIONS, dtype=np.float64
+        )
         self.sync_kinematics_base_pose()
         self.home_ee_position, home_ee_rotation = self.compute_home_ee_pose()
         self.home_ee_orientation = rot_matrices_to_quats(home_ee_rotation)
@@ -1945,21 +1948,32 @@ class AutoController(BaseController):
         if action.joint_positions is None:
             return
 
-        current_positions = self.robot.get_joint_positions()
-        if current_positions is None:
-            self.controller.apply_action(action)
-            return
-
         if action.joint_indices is None:
             joint_positions = np.array(action.joint_positions, dtype=np.float64)
-            for gripper_index in self.gripper_joint_indices:
+            joint_velocities = (
+                None
+                if action.joint_velocities is None
+                else np.array(action.joint_velocities, dtype=np.float64)
+            )
+            joint_efforts = (
+                None
+                if action.joint_efforts is None
+                else np.array(action.joint_efforts, dtype=np.float64)
+            )
+            for target_offset, gripper_index in enumerate(self.gripper_joint_indices):
                 if gripper_index < joint_positions.shape[0]:
-                    joint_positions[gripper_index] = current_positions[gripper_index]
+                    joint_positions[gripper_index] = self.gripper_target_positions[
+                        target_offset
+                    ]
+                if joint_velocities is not None and gripper_index < joint_velocities.shape[0]:
+                    joint_velocities[gripper_index] = 0.0
+                if joint_efforts is not None and gripper_index < joint_efforts.shape[0]:
+                    joint_efforts[gripper_index] = 0.0
             self.controller.apply_action(
                 ArticulationAction(
                     joint_positions=joint_positions,
-                    joint_velocities=action.joint_velocities,
-                    joint_efforts=action.joint_efforts,
+                    joint_velocities=joint_velocities,
+                    joint_efforts=joint_efforts,
                     joint_indices=action.joint_indices,
                 )
             )
@@ -1969,40 +1983,55 @@ class AutoController(BaseController):
         keep_mask = ~np.isin(joint_indices, self.gripper_joint_indices)
         if not np.any(keep_mask):
             return
+        arm_joint_positions = np.array(action.joint_positions)[keep_mask]
+        arm_joint_indices = joint_indices[keep_mask]
+        merged_joint_positions = np.concatenate(
+            [arm_joint_positions, self.gripper_target_positions]
+        )
+        merged_joint_indices = np.concatenate(
+            [arm_joint_indices, self.gripper_joint_indices]
+        )
+        merged_joint_velocities = None
+        if action.joint_velocities is not None:
+            merged_joint_velocities = np.concatenate(
+                [
+                    np.array(action.joint_velocities)[keep_mask],
+                    np.zeros(len(self.gripper_joint_indices), dtype=np.float64),
+                ]
+            )
+        merged_joint_efforts = None
+        if action.joint_efforts is not None:
+            merged_joint_efforts = np.concatenate(
+                [
+                    np.array(action.joint_efforts)[keep_mask],
+                    np.zeros(len(self.gripper_joint_indices), dtype=np.float64),
+                ]
+            )
         self.controller.apply_action(
             ArticulationAction(
-                joint_positions=np.array(action.joint_positions)[keep_mask],
-                joint_velocities=(
-                    None
-                    if action.joint_velocities is None
-                    else np.array(action.joint_velocities)[keep_mask]
-                ),
-                joint_efforts=(
-                    None
-                    if action.joint_efforts is None
-                    else np.array(action.joint_efforts)[keep_mask]
-                ),
-                joint_indices=joint_indices[keep_mask],
+                joint_positions=merged_joint_positions,
+                joint_velocities=merged_joint_velocities,
+                joint_efforts=merged_joint_efforts,
+                joint_indices=merged_joint_indices,
             )
         )
 
     def grip(self) -> ControlCommandResponse:
-        self.controller.apply_action(
-            ArticulationAction(
-                joint_positions=np.array(GRIPPER_CLOSED_POSITIONS, dtype=np.float64),
-                joint_indices=self.gripper_joint_indices,
-            )
-        )
+        self.apply_gripper_target(GRIPPER_CLOSED_POSITIONS)
         return ControlCommandResponse(True, "Gripper closing.")
 
     def release(self) -> ControlCommandResponse:
+        self.apply_gripper_target(GRIPPER_OPEN_POSITIONS)
+        return ControlCommandResponse(True, "Gripper opening.")
+
+    def apply_gripper_target(self, target_positions: list[float]) -> None:
+        self.gripper_target_positions = np.array(target_positions, dtype=np.float64)
         self.controller.apply_action(
             ArticulationAction(
-                joint_positions=np.array(GRIPPER_OPEN_POSITIONS, dtype=np.float64),
+                joint_positions=self.gripper_target_positions,
                 joint_indices=self.gripper_joint_indices,
             )
         )
-        return ControlCommandResponse(True, "Gripper opening.")
 
     def stop(self) -> ControlCommandResponse:
         self.phase_dwell_until = None
@@ -2058,15 +2087,10 @@ class AutoController(BaseController):
         )
 
     def apply_home_arm_direct(self) -> None:
-        self.controller.apply_action(self.get_home_arm_action())
+        self.apply_arm_action_preserving_gripper(self.get_home_arm_action())
 
     def apply_initial_gripper_open_direct(self) -> None:
-        self.controller.apply_action(
-            ArticulationAction(
-                joint_positions=np.array(GRIPPER_OPEN_POSITIONS, dtype=np.float64),
-                joint_indices=self.gripper_joint_indices,
-            )
-        )
+        self.apply_gripper_target(GRIPPER_OPEN_POSITIONS)
 
     def ensure_home_pose(self) -> None:
         if self.home_applied:
