@@ -1,12 +1,19 @@
 # DB Agent Context
 
+Role separation:
+
+- The Python system prompt defines your response format and source-of-truth role.
+- This CLAUDE.md file defines robot-domain observation policy and durable project lessons.
+- MEMORY.md is no longer loaded or updated by the CLI.
+
 Use ROS2 MarkerArray, image, pose, EEF pose, and JointState snapshots as source data.
 
-- Treat goal marker poses as physical surface markers. They describe the visible/physical goal region, not the exact end-effector target for placement.
-- When asked for a placement pose, reason about a pose above the goal surface using goal thickness/rim, object size, held-object geometry, and EEF clearance. Avoid both collision with the goal marker/rim and dropping from unnecessarily high above it.
-- Prefer `world_summary.goals[color].eef_drop_pose` or a pose at/above `minimum_safe_release_z` for goal Release. Never recommend `physical_marker_pose` as the Release predecessor.
+- Treat `world_summary.control_service_contract` as the ordinary execution contract because it describes the `world.py` ControlCommand service baseline.
+- For ordinary placement, prefer the object-specific `world_summary.objects_by_id[object_id].recommended_goal_drop_pose` over raw goal marker poses or derived recovery poses. If no object-specific recommendation exists, use `world_summary.control_service_contract.goal_targets[color]`.
+- Goal marker poses and `eef_drop_pose`/`minimum_safe_release_z` are diagnostic and recovery references. Use them when explaining why a failed placement may need a different pose, not as the default plan.
+- `world.py` enforces movement shape at the action level: vertical rise to home-level Z, high-Z horizontal travel, then vertical descent. `Moving` descends slightly below the object marker for grasping; `Centering` and `Placing` descend slightly above their semantic target and apply a small final XY variation.
+- `world.py` uses each robot's home EEF orientation during movement commands to avoid left-arm tip flips from mismatched requested orientations.
 - Use gripper joint positions from JointState to summarize gripper state. Larger finger joint values mean more open; smaller values mean more closed.
+- Franka finger joints are about `0.04` when fully open and about `0.0` when fully closed with no object. For runtime `Grip` assessment, near empty fully-closed means failed empty grasp; every other finger position is treated as success.
 - When judging grasp success, compare object pose before/after with EEF pose and gripper state. If the EEF moved but the object did not follow after `Grip` and a subsequent motion, the grasp likely failed or slipped.
-- Remember the Isaac `Moving` service behavior: horizontal XY motion happens at the current EEF Z before vertical Z motion. When asked about route safety, consider intermediate low sweeps, not only start/end poses.
-- For crowded scenes, summarize whether an object transfer should use a lifted/clearance waypoint above the table before horizontal motion.
-- For grasp planning, distinguish approach poses from grasp poses. A high pose above an object is useful for approach, but the EEF must descend to the object's current pose/grasp height before `Grip`.
+- For grasp planning, the working default is `Moving(object marker pose)` immediately before `Grip`, with vertical end-effector orientation enforced by the runtime.

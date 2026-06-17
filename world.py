@@ -78,6 +78,9 @@ GRIPPER_JOINT_NAMES = ["panda_finger_joint1", "panda_finger_joint2"]
 AUTO_MOVE_POSITION_TOLERANCE = 0.008
 AUTO_MOVE_ORIENTATION_TOLERANCE = 0.07
 AUTO_MOVE_DWELL_SEC = 0.5
+AUTO_MOVE_HOME_CLEARANCE_Z_OFFSET = 0.05
+MOVING_GRASP_Z_OFFSET = -0.003
+PLACEMENT_Z_OFFSET = 0.01
 
 OBJECT_COLORS = {
     "red": (0.95, 0.05, 0.05),
@@ -188,6 +191,20 @@ ROBOT_WORKSPACE_X_RANGE = (0.32, 0.84)
 ROBOT_WORKSPACE_Y_RANGE = (-0.26, 0.26)
 MIN_OBJECT_CLEARANCE = 0.035
 MAX_SPAWN_ATTEMPTS = 1000
+TABLE_SPAWN_INNER_SCALE = 0.68
+TABLE_CENTER_SPAWN_EXCLUSION_RADIUS = 0.05
+DROP_VARIATION_STEP = 0.032
+DROP_VARIATION_PATTERN = (
+    np.array([1.0, 0.0]),
+    np.array([-1.0, 0.0]),
+    np.array([0.0, 1.0]),
+    np.array([0.0, -1.0]),
+    np.array([1.0, 1.0]),
+    np.array([-1.0, 1.0]),
+    np.array([1.0, -1.0]),
+    np.array([-1.0, -1.0]),
+    np.array([0.0, 0.0]),
+)
 
 TABLE_STATIC_FRICTION = 2.2
 TABLE_DYNAMIC_FRICTION = 1.8
@@ -393,7 +410,7 @@ class CustomScene:
     def table_limited_workspace(
         self, footprint_radius: float
     ) -> tuple[tuple[float, float], tuple[float, float]]:
-        spawn_dims = TABLE_DIMS[:2] * 0.8
+        spawn_dims = TABLE_DIMS[:2] * TABLE_SPAWN_INNER_SCALE
         table_x_min = TABLE_CENTER[0] - spawn_dims[0] / 2.0 + footprint_radius
         table_x_max = TABLE_CENTER[0] + spawn_dims[0] / 2.0 - footprint_radius
         table_y_min = TABLE_CENTER[1] - spawn_dims[1] / 2.0 + footprint_radius
@@ -421,6 +438,8 @@ class CustomScene:
         x_range, y_range = self.table_limited_workspace(footprint_radius)
         for _ in range(MAX_SPAWN_ATTEMPTS):
             xy = np.array([rng.uniform(*x_range), rng.uniform(*y_range)])
+            if self.inside_center_spawn_exclusion(xy, footprint_radius):
+                continue
             if self.overlaps_goal_zone(xy, footprint_radius):
                 continue
             if all(
@@ -434,6 +453,13 @@ class CustomScene:
             "Could not sample a non-overlapping object pose. Reduce object counts or sizes."
         )
 
+    def inside_center_spawn_exclusion(
+        self, xy: np.ndarray, footprint_radius: float
+    ) -> bool:
+        center_xy = TABLE_CENTER[:2]
+        exclusion_radius = TABLE_CENTER_SPAWN_EXCLUSION_RADIUS + footprint_radius
+        return float(np.linalg.norm(xy - center_xy)) <= exclusion_radius
+
     def overlaps_goal_zone(self, xy: np.ndarray, footprint_radius: float) -> bool:
         clearance = footprint_radius + MIN_OBJECT_CLEARANCE
         for zone in GOAL_ZONES.values():
@@ -445,9 +471,20 @@ class CustomScene:
 
     def create_spawn_specs(self, rng: np.random.Generator) -> list[SpawnSpec]:
         specs: list[SpawnSpec] = []
+        total_objects = NUM_CUBES + NUM_CAPSULES + NUM_SPHERES
+        color_names: list[str] = []
+        if total_objects == 1:
+            color_names = ["red" if rng.random() < 0.5 else "blue"]
+        elif total_objects >= 2:
+            color_names = ["red", "blue"]
+            color_names.extend(
+                "red" if rng.random() < 0.5 else "blue"
+                for _ in range(total_objects - 2)
+            )
+            rng.shuffle(color_names)
 
         def object_color() -> np.ndarray:
-            color_name = "red" if rng.random() < 0.5 else "blue"
+            color_name = color_names.pop() if color_names else "red"
             return np.array(OBJECT_COLORS[color_name], dtype=np.float64)
 
         for index in range(NUM_CUBES):
@@ -1803,6 +1840,7 @@ class AutoController(BaseController):
         self.home_ee_position, home_ee_rotation = self.compute_home_ee_pose()
         self.home_ee_orientation = rot_matrices_to_quats(home_ee_rotation)
         self.home_applied = False
+        self.drop_variation_index = 0
 
     def sync_kinematics_base_pose(self) -> None:
         base_position, base_orientation = self.robot.get_world_pose()
@@ -1856,11 +1894,11 @@ class AutoController(BaseController):
         action = request.action.strip()
         try:
             if action == ACTION_MOVING:
-                return self.move(request.target_pose, ACTION_MOVING)
+                return self.move_to_grasp(request.target_pose)
             if action == ACTION_CENTERING:
-                return self.move(request.target_pose, ACTION_CENTERING)
+                return self.center(request.target_pose)
             if action == ACTION_PLACING:
-                return self.move(request.target_pose, ACTION_PLACING)
+                return self.place(request.target_pose)
             if action == ACTION_GRIP:
                 return self.grip()
             if action == ACTION_REALEASE:
@@ -1878,26 +1916,96 @@ class AutoController(BaseController):
                 False, f"Action '{request.action}' failed and stop was called: {exc}"
             )
 
-    def move(
-        self, target_pose: PoseCommand, action_name: str
+    def queue_vertical_horizontal_vertical_motion(
+        self,
+        target_pose: PoseCommand,
+        action_name: str,
+        final_z_offset: float,
+        final_relation: str,
     ) -> ControlCommandResponse:
-        target_orientation = QuaternionUtils.xyzw_to_wxyz(target_pose.orientation_xyzw)
         fk_position, _ = self.compute_current_ee_pose(position_only=True)
-        horizontal_position = np.array(target_pose.position, dtype=np.float64)
-        horizontal_position[2] = float(fk_position[2])
-        vertical_position = np.array(target_pose.position, dtype=np.float64)
+        final_position = np.array(target_pose.position, dtype=np.float64)
+        final_position[2] = float(target_pose.position[2]) + final_z_offset
+        if action_name in {ACTION_CENTERING, ACTION_PLACING}:
+            final_position = self.apply_drop_variation(final_position, action_name)
+        home_clearance_z = (
+            float(self.home_ee_position[2]) + AUTO_MOVE_HOME_CLEARANCE_Z_OFFSET
+        )
+        transit_z = max(
+            home_clearance_z,
+            float(fk_position[2]),
+            float(final_position[2]),
+        )
+        current_high_position = np.array(fk_position, dtype=np.float64)
+        current_high_position[2] = transit_z
+        target_high_position = np.array(final_position, dtype=np.float64)
+        target_high_position[2] = transit_z
         self.motion_phases = [
             MotionPhase(
-                horizontal_position,
-                target_orientation,
+                current_high_position,
+                self.home_ee_orientation,
                 dwell_after=AUTO_MOVE_DWELL_SEC,
             ),
-            MotionPhase(vertical_position, target_orientation),
+            MotionPhase(
+                target_high_position,
+                self.home_ee_orientation,
+                dwell_after=AUTO_MOVE_DWELL_SEC,
+            ),
+            MotionPhase(final_position, self.home_ee_orientation),
         ]
         self.phase_dwell_until = None
         return ControlCommandResponse(
             True,
-            f"Queued {action_name}: horizontal XY/orientation motion, 0.5s wait, then vertical Z descent.",
+            (
+                f"Queued {action_name}: vertical rise to home-level Z + {AUTO_MOVE_HOME_CLEARANCE_Z_OFFSET:.2f}m, 0.5s wait, "
+                f"horizontal XY motion at that clearance Z, 0.5s wait, then vertical descent to {final_relation}."
+            ),
+        )
+
+    def apply_drop_variation(
+        self, final_position: np.ndarray, action_name: str
+    ) -> np.ndarray:
+        pattern = DROP_VARIATION_PATTERN[
+            self.drop_variation_index % len(DROP_VARIATION_PATTERN)
+        ]
+        self.drop_variation_index += 1
+        varied_position = np.array(final_position, dtype=np.float64)
+        varied_position[:2] += pattern * DROP_VARIATION_STEP
+
+        inset = max(TABLE_RIM_THICKNESS + 0.02, DROP_VARIATION_STEP)
+        x_min = TABLE_CENTER[0] - TABLE_DIMS[0] / 2.0 + inset
+        x_max = TABLE_CENTER[0] + TABLE_DIMS[0] / 2.0 - inset
+        y_min = TABLE_CENTER[1] - TABLE_DIMS[1] / 2.0 + inset
+        y_max = TABLE_CENTER[1] + TABLE_DIMS[1] / 2.0 - inset
+        varied_position[0] = float(np.clip(varied_position[0], x_min, x_max))
+        varied_position[1] = float(np.clip(varied_position[1], y_min, y_max))
+        carb.log_info(
+            f"{action_name} target varied from {final_position[:2].tolist()} to {varied_position[:2].tolist()}"
+        )
+        return varied_position
+
+    def move_to_grasp(self, target_pose: PoseCommand) -> ControlCommandResponse:
+        return self.queue_vertical_horizontal_vertical_motion(
+            target_pose,
+            ACTION_MOVING,
+            MOVING_GRASP_Z_OFFSET,
+            "slightly below the object marker pose for grasping",
+        )
+
+    def center(self, target_pose: PoseCommand) -> ControlCommandResponse:
+        return self.queue_vertical_horizontal_vertical_motion(
+            target_pose,
+            ACTION_CENTERING,
+            PLACEMENT_Z_OFFSET,
+            "slightly above the center target",
+        )
+
+    def place(self, target_pose: PoseCommand) -> ControlCommandResponse:
+        return self.queue_vertical_horizontal_vertical_motion(
+            target_pose,
+            ACTION_PLACING,
+            PLACEMENT_Z_OFFSET,
+            "slightly above the placing point",
         )
 
     def step_motion(self) -> None:

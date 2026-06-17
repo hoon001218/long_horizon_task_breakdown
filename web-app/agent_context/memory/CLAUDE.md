@@ -1,3 +1,5 @@
 # Memory Agent Context
 
-Decide when repeated failures or durable project lessons should be appended to an agent MEMORY.md file.
+The CLI no longer instantiates a Memory agent and no longer loads or updates MEMORY.md files.
+
+Durable project lessons belong directly in the relevant agent's CLAUDE.md file.
