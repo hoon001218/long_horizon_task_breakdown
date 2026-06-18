@@ -84,9 +84,13 @@ OPENAI_API_URL = os.getenv(
 LLM_TEMPERATURE = 0.0
 LLM_TIMEOUT_SEC = 120
 
+MODE = os.getenv("CLI_MODE", "auto")  # "manual" or "auto"
 DEFAULT_COMMAND = "빨간 물체는 빨간 목표점에, 파란 물체는 파란 목표점에 놓아라."
+AUTO_COMMAND = os.getenv("CLI_AUTO_COMMAND", "모든 물체를 빨간 목표점에 놓아라")
 USE_DEFAULT_ON_EMPTY_INPUT = True
 SEND_IMAGE_TO_AGENTS = True
+SKIP_TROUBLESHOOTER = False
+USE_LLM_TROUBLESHOOTER = False
 
 MARKER_TOPIC = "/world/object_markers"
 IMAGE_TOPIC = "/world/top_camera/image_raw"
@@ -158,6 +162,8 @@ GRIP_SETTLE_SEC = 2.2
 RELEASE_SETTLE_SEC = 1.2
 PLACING_SETTLE_SEC = 2.5
 HOMING_SETTLE_SEC = 1.0
+RELEASE_VERIFY_TIMEOUT_SEC = 4.0
+MOVEMENT_VERIFY_TIMEOUT_SEC = 6.0
 PRE_GRIP_SETTLE_TIMEOUT_SEC = 8.0
 PRE_GRIP_ARM_VELOCITY_TOL = 0.05
 GRIPPER_OPEN_POSITION_MIN = 0.033
@@ -165,17 +171,21 @@ GRIPPER_EMPTY_CLOSED_POSITION_MAX = 0.012
 GRIP_CONTACT_MIN_CLOSING_DELTA = 0.001
 GRIP_SETTLED_FINGER_VELOCITY_TOL = 0.02
 GRIP_ACTIVE_FINGER_VELOCITY_TOL = 0.05
+GRIPPER_OPEN_VERIFY_VELOCITY_TOL = 0.01
 GRIP_EEF_STATIONARY_XY_TOL = 0.006
 GRIP_EEF_STATIONARY_Z_TOL = 0.006
-PENDING_OBSERVATION_SEC = 1.0
-MAX_PENDING_DIAGNOSES = 8
 READINESS_REPORT_SEC = 3.0
 MAX_MAIN_STEPS = 120
 MAX_REPLAN_ATTEMPTS_PER_TASK = 3
+DISPLAY_VALUE_MAX_CHARS = 72
+DISPLAY_FLAT_MAX_CHARS = 320
 OBJECT_APPROACH_XY_TOL = 0.06
 OBJECT_APPROACH_Z_TOL = 0.035
 PRE_GRIP_OBJECT_XY_TOL = 0.04
 PRE_GRIP_OBJECT_Z_TOL = 0.018
+GRIP_HELD_OBJECT_XY_TOL = 0.045
+GRIP_HELD_OBJECT_Z_TOL = 0.05
+GRIP_HELD_OBJECT_Z_RELAXED_TOL = 0.12
 EEF_REACHED_RELAXED_XY_TOL = 0.04
 EEF_REACHED_RELAXED_Z_TOL = 0.018
 GOAL_DROP_EEF_Z_OFFSET = 0.095
@@ -184,11 +194,19 @@ MOVEMENT_NO_PROGRESS_XY_TOL = 0.01
 MOVEMENT_NO_PROGRESS_Z_TOL = 0.006
 MOVEMENT_CLEAR_MISS_XY_TOL = 0.12
 CARRIED_OBJECT_TARGET_XY_TOL = 0.05
+HANDOVER_TARGET_XY_TOL = 0.07
+OBJECT_SUPPORT_Z_TOL = 0.055
+OBJECT_EEF_DETACHED_XY_MIN = 0.07
+OBJECT_EEF_DETACHED_Z_MIN = 0.08
 WORKSPACE_RADIUS_FRACTION_OF_TABLE_LENGTH = 0.65
 REACH_BORDERLINE_MARGIN_M = 0.06
+PICK_TO_HANDOVER = "PICK_TO_HANDOVER"
+VERIFY_HANDOVER = "VERIFY_HANDOVER"
+HANDOVER_TO_GOAL = "HANDOVER_TO_GOAL"
+VERIFY_GOAL = "VERIFY_GOAL"
+RECOVER = "RECOVER"
 TROUBLESHOOTER_STATUSES = {
     "success",
-    "pending",
     "retry",
     "replan_task",
     "replan_all",
@@ -236,32 +254,93 @@ class AgentReply:
 
 
 class Reporter:
+    TITLE_STYLES = {
+        "startup": "bright_white",
+        "waiting": "yellow",
+        "task baseline": "magenta",
+        "task filter": "magenta",
+        "task skipped": "magenta",
+        "task replan": "magenta",
+        "task replan skipped": "magenta",
+        "task": "bright_magenta",
+        "action plan rejected": "cyan",
+        "action": "bright_cyan",
+        "controlcommand": "bright_green",
+        "runtime check": "bright_green",
+        "troubleshooter": "bright_yellow",
+        "complete": "bold green",
+        "completion blocked": "red",
+        "no tasks": "blue",
+    }
+
     def __init__(self) -> None:
         self.console = Console() if RICH_AVAILABLE else None
 
+    @staticmethod
+    def truncate_text(text: str, max_chars: int = DISPLAY_VALUE_MAX_CHARS) -> str:
+        text = text.replace("\n", " ")
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= 8:
+            return text[:max_chars]
+        head = max_chars // 2 - 2
+        tail = max_chars - head - 5
+        return f"{text[:head]}...{text[-tail:]}"
+
+    @classmethod
+    def format_value(cls, value: Any, max_chars: int = DISPLAY_VALUE_MAX_CHARS) -> str:
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except TypeError:
+                text = str(value)
+        else:
+            text = str(value)
+        return cls.truncate_text(text, max_chars=max_chars)
+
+    @classmethod
+    def style_for_title(cls, title: str) -> str:
+        lowered = title.lower()
+        for marker, style in cls.TITLE_STYLES.items():
+            if marker in lowered:
+                return style
+        return "white"
+
     def print(self, message: str) -> None:
         if self.console is not None:
-            self.console.print(message)
+            self.console.print(self.truncate_text(message, DISPLAY_FLAT_MAX_CHARS))
         else:
-            print(message)
+            print(self.truncate_text(message, DISPLAY_FLAT_MAX_CHARS))
 
     def error(self, message: str) -> None:
+        message = self.truncate_text(message, DISPLAY_FLAT_MAX_CHARS)
         if self.console is not None:
             self.console.print(f"[bold red]{message}[/bold red]")
         else:
             print(message, file=sys.stderr)
 
     def status(self, title: str, rows: dict[str, Any]) -> None:
+        style = self.style_for_title(title)
         if self.console is None:
-            flat = ", ".join(f"{key}={value}" for key, value in rows.items())
+            flat = ", ".join(
+                f"{key}={self.format_value(value)}" for key, value in rows.items()
+            )
+            flat = self.truncate_text(flat, DISPLAY_FLAT_MAX_CHARS)
             print(f"{title}: {flat}")
             return
         table = Table.grid(padding=(0, 2))
-        table.add_column(style="cyan")
+        table.add_column(style=style)
         table.add_column()
         for key, value in rows.items():
-            table.add_row(str(key), str(value))
-        self.console.print(Panel(table, title=title, expand=False))
+            table.add_row(str(key), self.format_value(value))
+        self.console.print(
+            Panel(
+                table,
+                title=f"[{style}]{title}[/]",
+                border_style=style,
+                expand=False,
+            )
+        )
 
 
 def ensure_json_object(text: str) -> dict[str, Any]:
@@ -554,8 +633,8 @@ def robot_appears_to_hold_object(
     error = pose_error(robot.get("end_effector_pose"), obj.get("pose"))
     return (
         isinstance(error, dict)
-        and error["xy"] <= PRE_GRIP_OBJECT_XY_TOL
-        and error["z_abs"] <= PRE_GRIP_OBJECT_Z_TOL
+        and error["xy"] <= GRIP_HELD_OBJECT_XY_TOL
+        and error["z_abs"] <= GRIP_HELD_OBJECT_Z_RELAXED_TOL
     )
 
 
@@ -632,7 +711,11 @@ def reach_is_usable(reach_info: Any) -> bool:
     }
 
 
-def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+def build_agent_world_summary(
+    snapshot: dict[str, Any],
+    requested_goal_assignments: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    requested_goal_assignments = requested_goal_assignments or {}
     table = snapshot.get("table") if isinstance(snapshot.get("table"), dict) else {}
     goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
     robots = snapshot.get("robots") if isinstance(snapshot.get("robots"), dict) else {}
@@ -648,18 +731,7 @@ def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     )
     table_length = scale_value(table_scale, "x", DEFAULT_TABLE_SIZE["x"])
     workspace_radius = table_length * WORKSPACE_RADIUS_FRACTION_OF_TABLE_LENGTH
-    object_z_values = [
-        float(
-            obj.get("pose", {}).get("position", {}).get("z", DEFAULT_TABLE_CENTER["z"])
-        )
-        for obj in objects
-        if isinstance(obj, dict) and isinstance(obj.get("pose"), dict)
-    ]
-    handover_z = (
-        max(object_z_values) + GOAL_DROP_EEF_Z_OFFSET
-        if object_z_values
-        else DEFAULT_TABLE_CENTER["z"] + GOAL_DROP_EEF_Z_OFFSET
-    )
+    handover_z = float(CONTROL_TABLE_CENTER_TARGET["z"])
     table_center_handover_pose = pose_with_position(
         position_dict(
             float(table_position.get("x", DEFAULT_TABLE_CENTER["x"])),
@@ -726,16 +798,23 @@ def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
             continue
         object_id = str(obj.get("id"))
         object_color = str(obj.get("color") or "")
-        target_goal = enriched_goals.get(object_color)
+        intrinsic_goal = enriched_goals.get(object_color)
+        requested_goal_color = requested_goal_assignments.get(object_id)
+        requested_goal = (
+            enriched_goals.get(requested_goal_color)
+            if requested_goal_color is not None
+            else None
+        )
+        planning_goal = requested_goal if isinstance(requested_goal, dict) else intrinsic_goal
         object_reach = reach_summary_for_pose(obj.get("pose"), robots, workspace_radius)
         pickup_robot = nearest_robot_for_pose(obj.get("pose"), robots, workspace_radius)
         destination_robot = (
-            target_goal.get("nearest_robot") if isinstance(target_goal, dict) else None
+            planning_goal.get("nearest_robot") if isinstance(planning_goal, dict) else None
         )
         goal_reach = (
-            target_goal.get("reach")
-            if isinstance(target_goal, dict)
-            and isinstance(target_goal.get("reach"), dict)
+            planning_goal.get("reach")
+            if isinstance(planning_goal, dict)
+            and isinstance(planning_goal.get("reach"), dict)
             else {}
         )
         direct_robot_candidates = [
@@ -766,7 +845,7 @@ def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         elif handover_candidate and pickup_robot and destination_robot:
             route_hint = (
                 f"handover required by reach model: {pickup_robot} should move the object to table_center_handover, "
-                f"then {destination_robot} should deliver near {target_goal.get('id')}"
+                f"then {destination_robot} should deliver near {planning_goal.get('id')}"
             )
         elif pickup_robot and destination_robot:
             preferred_direct_robot = pickup_robot or destination_robot
@@ -779,9 +858,14 @@ def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
             "color": obj.get("color"),
             "pose": compact_pose(obj.get("pose")),
             "scale": obj.get("scale"),
-            "target_goal_color": object_color,
-            "target_goal_id": (
-                target_goal.get("id") if isinstance(target_goal, dict) else None
+            "intrinsic_color_goal": object_color,
+            "default_same_color_goal": object_color,
+            "default_same_color_goal_id": (
+                intrinsic_goal.get("id") if isinstance(intrinsic_goal, dict) else None
+            ),
+            "requested_goal_color": requested_goal_color,
+            "requested_goal_id": (
+                requested_goal.get("id") if isinstance(requested_goal, dict) else None
             ),
             "reach": object_reach,
             "nearest_robot": pickup_robot,
@@ -791,16 +875,25 @@ def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
             "handover_candidate": handover_candidate,
             "handover_needed": False,
             "recommended_goal_drop_pose": (
-                target_goal.get("placement_slots", [])[
+                planning_goal.get("placement_slots", [])[
                     stable_slot_index(
-                        object_id, len(target_goal.get("placement_slots", []))
+                        object_id, len(planning_goal.get("placement_slots", []))
                     )
                 ]
-                if isinstance(target_goal, dict)
-                and isinstance(target_goal.get("placement_slots"), list)
-                and target_goal.get("placement_slots")
+                if isinstance(planning_goal, dict)
+                and isinstance(planning_goal.get("placement_slots"), list)
+                and planning_goal.get("placement_slots")
                 else None
             ),
+            "recommended_goal_drop_poses_by_color": {
+                goal_color: goal["placement_slots"][
+                    stable_slot_index(object_id, len(goal["placement_slots"]))
+                ]
+                for goal_color, goal in enriched_goals.items()
+                if isinstance(goal, dict)
+                and isinstance(goal.get("placement_slots"), list)
+                and goal.get("placement_slots")
+            },
             "recommended_handover_drop_pose": (
                 named_locations["table_center_handover"]["drop_slots"][
                     stable_slot_index(
@@ -861,13 +954,13 @@ def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "control_service_contract": {
-                "canonical_object_transport_sequence": [
-                    "Moving(object marker pose)",
-                    "Grip",
-                    "Placing(goal pose) for color goals, or Centering(table_center_handover pose) for handover/table-center stages",
-                    "Release",
-                    "Homing",
-                ],
+            "canonical_object_transport_sequence": [
+                "Moving(object marker pose)",
+                "Grip",
+                "Placing(goal pose) for color goals, or Centering(table_center_handover pose) for handover/table-center stages",
+                "Release",
+                "Homing",
+            ],
             "table_center_target": pose_with_position(CONTROL_TABLE_CENTER_TARGET),
             "table_center_drop_slots": drop_slot_poses(CONTROL_TABLE_CENTER_TARGET),
             "goal_targets": {
@@ -891,10 +984,14 @@ def build_agent_world_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
             "For an object-moving task, the first Moving action must target the object's current pose.",
             "Only after Grip may a later movement action target a goal/drop pose.",
             "The service action spelling is 'Release'. The older typo is accepted only for backward compatibility.",
-            "For ordinary goal placement, prefer objects_by_id[object_id].recommended_goal_drop_pose; if absent, use control_service_contract.goal_targets[color].",
+            "For goal placement, use the destination goal named by the task/user command. Do not assume the destination color equals the object color unless the command asks for color matching.",
+            "objects_by_id[*].default_same_color_goal and intrinsic_color_goal describe the object's default color-matched destination only. They are not the current command's requested destination.",
+            "When requested_goal_color/requested_goal_id is present, every task, reach check, drop slot, and completion verifier must use that requested goal.",
+            "For ordinary same-color goal placement, objects_by_id[object_id].recommended_goal_drop_pose remains valid; for any explicit destination color, prefer recommended_goal_drop_poses_by_color[destination_color].",
             "Goal physical_marker_pose/eef_drop_pose are recovery references; do not prefer them over the baseline service target unless the baseline sequence actually failed.",
             "world.py already performs vertical rise, high-Z horizontal travel, vertical descent, and small final XY variation for Moving/Centering/Placing; agents should not duplicate those waypoints.",
-            "If replanning while a gripper is closed and no object is securely held, open it with Release before descending onto an object.",
+            "Before a new object-grasp descent, Release is allowed only when the object is not currently held or the gripper is clearly empty; do not drop a held object away from a support location.",
+            "If world.py rejects a movement with an IK message, first treat it as a reachability or current-posture problem: verify the selected robot against direct_robot_candidates/preferred_direct_robot, and prefer Homing before retrying the same robot's object Moving action.",
         ],
     }
 
@@ -1063,7 +1160,7 @@ def joint_motion_summary(joint_state: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "max_abs_velocity": max_abs_velocity,
         "appears_moving": max_abs_velocity > 0.05,
-        "note": "Use together with EEF pose error; tiny residual EEF error with low velocity should not stay pending.",
+        "note": "Use together with EEF pose error; runtime uses success/retry/replan only.",
     }
 
 
@@ -1147,6 +1244,12 @@ def build_execution_diagnostics(
     gripper_closing_delta = None
     if isinstance(mean_before, (int, float)) and isinstance(mean_after, (int, float)):
         gripper_closing_delta = float(mean_before) - float(mean_after)
+    held_object_proxy = (
+        action.action == ACTION_GRIP
+        and robot_appears_to_hold_object(
+            snapshot_after, action.robot_id, action.target_object_id
+        )
+    )
     grip_success_assessment = None
     if action.action == ACTION_GRIP:
         empty_fully_closed = (
@@ -1155,20 +1258,24 @@ def build_execution_diagnostics(
         )
         grip_success_assessment = {
             "applies_to": "Grip",
-            "single_runtime_rule": (
-                "After Grip, only mean_finger_position is used. "
-                "Near empty fully-closed means failed empty grasp; every other value is treated as success."
+            "runtime_rule": (
+                "After Grip, finger position is only an empty-grasp rejection signal. "
+                "A held state also requires the object to remain near the end effector; later carried movements must show the object following the EEF."
             ),
             "mean_finger_position": mean_after,
             "empty_fully_closed_threshold": GRIPPER_EMPTY_CLOSED_POSITION_MAX,
             "empty_fully_closed": empty_fully_closed,
-            "runtime_status": "retry" if empty_fully_closed else "success",
-            "gripper_closing_delta": gripper_closing_delta,
-            "do_not_use": (
-                "Do not use finger velocity, arm motion, EEF motion, alignment, or open/partially-closed state to keep Grip pending."
+            "object_near_eef_after": held_object_proxy,
+            "held_object_tolerance": {
+                "xy": GRIP_HELD_OBJECT_XY_TOL,
+                "z_abs_relaxed": GRIP_HELD_OBJECT_Z_RELAXED_TOL,
+            },
+            "runtime_status": (
+                "retry" if empty_fully_closed or not held_object_proxy else "success"
             ),
+            "gripper_closing_delta": gripper_closing_delta,
             "normal_contact_behavior": (
-                "A grasped object prevents empty full closure; any non-empty-closed finger position is accepted as holding/contact."
+                "A grasped object usually prevents empty full closure, but non-empty finger position alone is not enough to mark the object held."
             ),
         }
     return {
@@ -1230,27 +1337,73 @@ def build_execution_diagnostics(
             "applies_to": "Moving|Centering|Placing",
             "still_active": moving_still_active,
             "guidance": (
-                "If still_active is true, the motion has not settled yet. Diagnose pending rather than retry/replan. "
-                "Judge failed arrival only after the robot is no longer clearly moving or the pending observation limit is reached."
+                "If still_active is true, do not fail from transient pose error. Runtime uses success/retry/replan only."
             ),
         },
         "diagnostic_hints": [
             "For a pre-grasp Moving action before any Grip, an open gripper is expected and must not be diagnosed as failed grasp.",
-            "If a Moving action is still active, return pending; do not return retry just because the current sample is not yet at the target.",
+            "If a Moving action is still active, do not return retry just because the current sample is not yet at the target.",
             "If a Moving action is immediately before Grip and its target_pose is the object's marker pose, do not diagnose retry from EEF-object z difference alone. EEF frame z may remain above the object marker center because the marker is not the gripper frame.",
-            "For pre-grip Moving, prefer success when the service accepted the command, the motion has settled, and XY is near the object; use pending while still moving and retry only for clear XY miss, service failure, or settled wrong target.",
+            "For pre-grip Moving, prefer success when the service accepted the command; retry only for clear XY miss, service failure, or settled wrong target.",
             "For a Grip action, the immediately preceding Moving must have settled at the grasp pose; a high clearance waypoint is not enough.",
-            "After Grip, use exactly one runtime check: if mean_finger_position is near empty fully-closed, the grasp failed; otherwise treat Grip as successful.",
+            "After Grip, reject empty fully-closed fingers and verify that the object remains near the end effector before treating it as held.",
             "After a post-grip Moving/lift, the target object should move with the end effector; if object_pose_delta is tiny, the grasp likely failed or slipped.",
             "For Grip, the pre-grip wait already checks descent settling before sending Grip.",
-            "For Grip, do not use joint motion, finger velocity, EEF motion, alignment, or open/partially-closed labels to keep the action pending.",
-            "For Grip, fully open, open-range, and partially closed finger positions are all accepted unless the fingers are near empty fully-closed.",
-            "For Moving/Centering/Placing, a service success only means the target was queued. If arm_motion_after is settled, EEF is still far from target, and eef_pose_delta is near zero, the queued move did not actually execute and should be replanned rather than kept pending.",
-            "If replanning and the gripper is closed without a secure object, Release should occur before descending toward an object.",
+            "For Grip, finger position alone is not authoritative; object-EEF proximity is the immediate held-state proxy, and later carried movement must show object transport.",
+            "For Moving/Centering/Placing, a service success often means the target was queued. If arm_motion_after is settled, EEF is still far from target, and eef_pose_delta is near zero, the queued move did not actually execute and should be replanned.",
+            "If action_result.message says IK could not solve a phase target, the movement was rejected before execution. Check whether the selected robot is wrong for the object/target; if the robot is plausible, recover with Homing before retrying the object Moving action.",
+            "Before a new object-grasp descent, Release is useful for an empty/stale gripper, but runtime must not Release a held object away from goal or handover support.",
             "For goal placement, target_pose z should be above the goal surface marker, not equal to the physical marker z.",
-            "If eef_reach_assessment.relaxed_reached is true, prefer success over pending unless task-level evidence contradicts it.",
+            "If eef_reach_assessment.relaxed_reached is true, prefer success unless task-level evidence contradicts it.",
         ],
     }
+
+
+def ik_rejection_guidance(result: ActionResult, snapshot: dict[str, Any]) -> str | None:
+    message = result.message.lower()
+    if "ik could not solve" not in message and "ik failed" not in message:
+        return None
+    summary = build_agent_world_summary(snapshot)
+    object_id = result.action.target_object_id
+    obj = (
+        summary.get("objects_by_id", {}).get(object_id)
+        if isinstance(summary.get("objects_by_id"), dict)
+        else None
+    )
+    robot_id = result.action.robot_id
+    selected_robot_note = ""
+    if isinstance(obj, dict):
+        candidates = obj.get("direct_robot_candidates")
+        preferred = obj.get("preferred_direct_robot")
+        nearest = obj.get("nearest_robot")
+        destination_nearest = obj.get("destination_nearest_robot")
+        selected_robot_note = (
+            f" Object reach hints: selected_robot={robot_id}, "
+            f"preferred_direct_robot={preferred}, direct_robot_candidates={candidates}, "
+            f"object_nearest_robot={nearest}, destination_nearest_robot={destination_nearest}."
+        )
+        if isinstance(candidates, list) and candidates and robot_id not in candidates:
+            selected_robot_note += (
+                " The selected robot is not a direct candidate, so reassign the stage "
+                "to a reachable robot or split through table_center_handover."
+            )
+        elif preferred in CONTROL_SERVICE_TOPICS and robot_id != preferred:
+            selected_robot_note += (
+                " The selected robot differs from preferred_direct_robot; consider replanning "
+                "with the preferred robot if the task text does not explicitly require this robot."
+            )
+        else:
+            selected_robot_note += (
+                " The selected robot is plausible, so recover posture with Homing before retrying "
+                "the same object Moving action."
+            )
+    return (
+        "IK rejection detected from world.py. Before repeating the failed primitive, "
+        "check whether the robot assignment is wrong for the object/target. If the robot "
+        "assignment is plausible, prepend Homing for that robot and then retry the task "
+        "from the refreshed snapshot; if it is not plausible, replan with the reachable robot "
+        "or a table_center_handover split." + selected_robot_note
+    )
 
 
 def enforce_runtime_safety_diagnosis(
@@ -1276,13 +1429,25 @@ def enforce_runtime_safety_diagnosis(
             isinstance(mean_position, (int, float))
             and float(mean_position) <= GRIPPER_EMPTY_CLOSED_POSITION_MAX
         )
-        if empty_closed_grip:
+        object_near_eef = robot_appears_to_hold_object(
+            snapshot_after, action.robot_id, action.target_object_id
+        )
+        if empty_closed_grip or not object_near_eef:
             return {
                 **diagnosis,
                 "status": "retry",
                 "message": (
-                    "Runtime Grip assessment failed: finger position is near the empty fully-closed value "
-                    f"({mean_position:.5f}), so the gripper likely closed without an object. "
+                    "Runtime Grip assessment failed: "
+                    + (
+                        f"finger position is near the empty fully-closed value ({mean_position:.5f}); "
+                        if empty_closed_grip and isinstance(mean_position, (int, float))
+                        else ""
+                    )
+                    + (
+                        "object is not near the end effector after Grip; "
+                        if not object_near_eef
+                        else ""
+                    )
                     + str(diagnosis.get("message", ""))
                 ),
                 "execution_diagnostics": diagnostics,
@@ -1305,7 +1470,10 @@ def deterministic_grip_diagnosis(
         if isinstance(gripper_after, dict)
         else None
     )
-    if isinstance(mean_position, (int, float)) and float(mean_position) <= GRIPPER_EMPTY_CLOSED_POSITION_MAX:
+    if (
+        isinstance(mean_position, (int, float))
+        and float(mean_position) <= GRIPPER_EMPTY_CLOSED_POSITION_MAX
+    ):
         return {
             "status": "retry",
             "message": (
@@ -1315,19 +1483,57 @@ def deterministic_grip_diagnosis(
             "source": "runtime_grip_assessment",
             "execution_diagnostics": diagnostics,
         }
+    if not robot_appears_to_hold_object(
+        snapshot_after, result.action.robot_id, result.action.target_object_id
+    ):
+        return {
+            "status": "retry",
+            "message": (
+                "Runtime Grip assessment failed: finger position alone is not enough, "
+                "and the object is not near the end effector after Grip."
+            ),
+            "source": "runtime_grip_assessment",
+            "execution_diagnostics": diagnostics,
+        }
     return {
         "status": "success",
         "message": (
-            "Runtime Grip assessment passed: finger position is not confirmed near empty fully-closed"
+            "Runtime Grip assessment passed: fingers are not empty fully-closed and the object is near the end effector"
             + (
                 f" ({float(mean_position):.5f})"
                 if isinstance(mean_position, (int, float))
                 else ""
             )
-            + ", so Grip is treated as successful."
+            + "."
         ),
         "source": "runtime_grip_assessment",
         "execution_diagnostics": diagnostics,
+    }
+
+
+def deterministic_release_diagnosis(
+    result: ActionResult, snapshot_after: dict[str, Any]
+) -> dict[str, Any] | None:
+    if result.action.action != ACTION_RELEASE or not result.success:
+        return None
+    return {
+        "status": "success",
+        "message": "Runtime Release assessment passed: command was accepted and finger opening was verified.",
+        "source": "runtime_release_assessment",
+        "execution_diagnostics": build_execution_diagnostics(result, snapshot_after),
+    }
+
+
+def accepted_action_success_diagnosis(
+    result: ActionResult, snapshot_after: dict[str, Any], source: str
+) -> dict[str, Any]:
+    return {
+        "status": "success",
+        "message": (
+            f"Action accepted by world.py and no deterministic failure rule applied: {result.message}"
+        ),
+        "source": source,
+        "execution_diagnostics": build_execution_diagnostics(result, snapshot_after),
     }
 
 
@@ -1370,13 +1576,30 @@ def deterministic_movement_diagnosis(
         }
     if arm_motion.get("appears_moving") is True:
         return {
-            "status": "pending",
+            "status": "retry",
             "message": (
-                f"Runtime {result.action.action} assessment is waiting: arm joints are still moving toward the target."
+                f"Runtime {result.action.action} accepted: arm joints still report motion, "
+                "so runtime will wait/retry from a fresh snapshot instead of continuing to the next primitive."
             ),
             "source": "runtime_movement_assessment",
             "execution_diagnostics": diagnostics,
         }
+    if result.action.action in {ACTION_CENTERING, ACTION_PLACING}:
+        if (
+            isinstance(object_target_error, dict)
+            and float(object_target_error.get("xy", 0.0))
+            > CARRIED_OBJECT_TARGET_XY_TOL
+        ):
+            return {
+                "status": "replan_task",
+                "message": (
+                    f"Runtime {result.action.action} assessment failed after wait: "
+                    "the arm is settled but the carried object is not near the destination. "
+                    "Do not Release from this state; retry or replan from a fresh snapshot."
+                ),
+                "source": "runtime_movement_assessment",
+                "execution_diagnostics": diagnostics,
+            }
     if isinstance(eef_error, dict):
         no_progress = False
         clear_miss = float(eef_error.get("xy", 0.0)) >= MOVEMENT_CLEAR_MISS_XY_TOL
@@ -1386,9 +1609,7 @@ def deterministic_movement_diagnosis(
                 and abs(float(eef_delta.get("dy", 0.0))) <= MOVEMENT_NO_PROGRESS_XY_TOL
                 and abs(float(eef_delta.get("dz", 0.0))) <= MOVEMENT_NO_PROGRESS_Z_TOL
             )
-        if clear_miss and (
-            no_progress or arm_motion.get("appears_moving") is not True
-        ):
+        if clear_miss and (no_progress or arm_motion.get("appears_moving") is not True):
             return {
                 "status": "replan_task",
                 "message": (
@@ -1400,11 +1621,11 @@ def deterministic_movement_diagnosis(
                 "execution_diagnostics": diagnostics,
             }
         return {
-            "status": "pending",
+            "status": "success",
             "message": (
-                f"Runtime {result.action.action} assessment is waiting: target has not been reached yet "
+                f"Runtime {result.action.action} accepted without wait-state diagnosis: target is not within relaxed tolerance "
                 f"(xy_error={float(eef_error.get('xy', 0.0)):.3f}, z_error={float(eef_error.get('z_abs', 0.0)):.3f}). "
-                "Do not continue to Release until this movement succeeds."
+                "Task-level snapshot verification will catch an actual failed placement."
             ),
             "source": "runtime_movement_assessment",
             "execution_diagnostics": diagnostics,
@@ -1429,6 +1650,7 @@ def validate_action_sequence_against_snapshot(
         for goal in goals.values()
         if isinstance(goal, dict) and goal.get("id")
     }
+    held_state: dict[tuple[str | None, str | None], bool] = {}
     for index, action in enumerate(actions):
         object_id = action.target_object_id
         if object_id in goal_ids:
@@ -1469,44 +1691,144 @@ def validate_action_sequence_against_snapshot(
                     "Grip predecessor Moving appears to hover above or away from the object; "
                     "insert a Moving descent to the object's current pose/grasp height immediately before Grip"
                 )
+        if action.action in {ACTION_CENTERING, ACTION_PLACING} and object_id:
+            held_key = (action.robot_id, object_id)
+            held = held_state.get(held_key)
+            if held is None:
+                held = robot_appears_to_hold_object(
+                    snapshot, action.robot_id, object_id
+                )
+            if not held:
+                raise ValueError(
+                    f"{action.action} requires {action.robot_id} to already hold "
+                    f"{object_id}; use Moving(current object pose) -> Grip -> "
+                    f"{action.action} instead of starting from the destination action"
+                )
         if action.action == ACTION_RELEASE:
             if index == 0:
-                continue
-            previous_action = actions[index - 1]
-            if previous_action.action == ACTION_RELEASE:
-                continue
-            if previous_action.action not in MOVEMENT_ACTIONS:
-                raise ValueError("Release must immediately follow a safe drop movement")
-            containing_goal = goal_containing_pose(previous_action.target_pose, goals)
-            if containing_goal is not None and previous_action.action != ACTION_PLACING:
-                goal_color, goal = containing_goal
-                required_z = required_goal_drop_z(goal)
-                release_point = pose_position(previous_action.target_pose)
-                if (
-                    required_z is not None
-                    and release_point is not None
-                    and release_point["z"] < required_z - GOAL_DROP_Z_TOL
-                ):
-                    raise ValueError(
-                        f"Release before {goal_color}_goal is too low for the goal surface/rim and held object; "
-                        f"use a drop pose at z >= {required_z:.3f}, not the physical marker z"
-                    )
+                pass
+            else:
+                previous_action = actions[index - 1]
+                if previous_action.action != ACTION_RELEASE:
+                    if previous_action.action not in MOVEMENT_ACTIONS:
+                        raise ValueError("Release must immediately follow a safe drop movement")
+                    containing_goal = goal_containing_pose(previous_action.target_pose, goals)
+                    if containing_goal is not None and previous_action.action != ACTION_PLACING:
+                        goal_color, goal = containing_goal
+                        required_z = required_goal_drop_z(goal)
+                        release_point = pose_position(previous_action.target_pose)
+                        if (
+                            required_z is not None
+                            and release_point is not None
+                            and release_point["z"] < required_z - GOAL_DROP_Z_TOL
+                        ):
+                            raise ValueError(
+                                f"Release before {goal_color}_goal is too low for the goal surface/rim and held object; "
+                                f"use a drop pose at z >= {required_z:.3f}, not the physical marker z"
+                            )
+        if action.action == ACTION_GRIP and action.robot_id and object_id:
+            held_state[(action.robot_id, object_id)] = True
+        elif action.action == ACTION_RELEASE and action.robot_id and object_id:
+            held_state[(action.robot_id, object_id)] = False
     if actions and actions[-1].action != ACTION_HOMING:
         raise ValueError("action sequence must end with Homing")
     for index, action in enumerate(actions):
-        if action.action == ACTION_HOMING and index != len(actions) - 1:
+        homing_is_recovery_prelude = (
+            index == 0
+            or (
+                index + 1 < len(actions)
+                and action_is_object_descent_before_grip(actions, index + 1, snapshot)
+            )
+        ) and len(actions) > 1
+        if (
+            action.action == ACTION_HOMING
+            and index != len(actions) - 1
+            and not homing_is_recovery_prelude
+        ):
             raise ValueError(
-                "Homing may appear only as the final action in a task action sequence"
+                "Homing may appear only as the final action, except immediately before an IK recovery Moving sequence"
             )
         if (
             action.action == ACTION_HOMING
             and action.robot_id not in CONTROL_SERVICE_TOPICS
         ):
-            raise ValueError("final Homing action must include a valid robot_id")
+            raise ValueError("Homing action must include a valid robot_id")
         if action.action == ACTION_HOMING and action.target_pose is not None:
-            raise ValueError("final Homing action must use target_pose null")
+            raise ValueError("Homing action must use target_pose null")
         if action.action == ACTION_HOMING and action.target_object_id is not None:
-            raise ValueError("final Homing action must use target_object_id null")
+            raise ValueError("Homing action must use target_object_id null")
+
+
+def validate_action_sequence_for_task(
+    actions: list[PrimitiveAction], task: str, snapshot: dict[str, Any]
+) -> None:
+    validate_action_sequence_against_snapshot(actions, snapshot)
+    task_object_id = infer_task_object_id(task, snapshot)
+    if task_object_id is not None:
+        missing_object_actions = [
+            (index + 1, action.action)
+            for index, action in enumerate(actions)
+            if action.action != ACTION_HOMING and action.target_object_id != task_object_id
+        ]
+        if missing_object_actions:
+            details = ", ".join(
+                f"#{index} {action_name}" for index, action_name in missing_object_actions
+            )
+            raise ValueError(
+                f"Action sequence must keep target_object_id={task_object_id!r} for non-Homing primitives: {details}"
+            )
+    task_robot_id = infer_task_robot_id(task, snapshot)
+    if task_robot_id not in CONTROL_SERVICE_TOPICS:
+        return
+    mismatches = [
+        (index + 1, action.robot_id, action.action)
+        for index, action in enumerate(actions)
+        if action.robot_id != task_robot_id
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"#{index} {action_name} robot_id={robot_id!r}"
+            for index, robot_id, action_name in mismatches
+        )
+        raise ValueError(
+            f"Action sequence robot_id mismatch for task actor {task_robot_id!r}: {details}"
+        )
+    task_goal = task_goal_color(task, snapshot)
+    destination_kind = task_destination_kind(task)
+    destination_actions = [
+        action for action in actions if action.action in {ACTION_CENTERING, ACTION_PLACING}
+    ]
+    if not destination_actions:
+        return
+    destination_action = destination_actions[-1]
+    if destination_kind == "handover":
+        if destination_action.action != ACTION_CENTERING:
+            raise ValueError("handover tasks must use Centering to table_center_handover")
+        object_id = infer_task_object_id(task, snapshot)
+        if not object_id:
+            raise ValueError("handover task must name an object id")
+        handover_summary = build_agent_world_summary(snapshot)
+        handover = handover_summary.get("named_locations", {}).get(
+            "table_center_handover"
+        )
+        handover_pose = handover.get("pose") if isinstance(handover, dict) else None
+        if xy_distance(destination_action.target_pose, handover_pose) is None:
+            raise ValueError("handover task destination pose is missing")
+        if (
+            xy_distance(destination_action.target_pose, handover_pose)
+            > HANDOVER_TARGET_XY_TOL
+        ):
+            raise ValueError("handover task destination was changed away from table_center_handover")
+        return
+    if task_goal is not None:
+        if destination_action.action != ACTION_PLACING:
+            raise ValueError("goal tasks must use Placing for the requested goal")
+        goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+        containing = goal_containing_pose(destination_action.target_pose, goals)
+        if containing is None or containing[0] != task_goal:
+            raise ValueError(
+                f"destination pose does not match requested goal {task_goal!r}"
+            )
 
 
 def action_is_object_descent_before_grip(
@@ -1536,7 +1858,7 @@ def action_is_object_descent_before_grip(
     )
 
 
-def ensure_release_before_closed_gripper_descent(
+def ensure_release_before_object_descent(
     actions: list[PrimitiveAction],
     snapshot: dict[str, Any],
 ) -> list[PrimitiveAction]:
@@ -1549,19 +1871,47 @@ def ensure_release_before_closed_gripper_descent(
             return actions
         if not action_is_object_descent_before_grip(actions, index, snapshot):
             continue
-        if robot_gripper_state(snapshot, action.robot_id) not in {
-            "closed",
-            "partially_closed_or_holding",
-        }:
+        if robot_appears_to_hold_object(snapshot, action.robot_id, action.target_object_id):
             return actions
         return [
+            *actions[:index],
             PrimitiveAction(
                 robot_id=action.robot_id,
                 action=ACTION_RELEASE,
                 target_pose=None,
                 target_object_id=action.target_object_id,
             ),
-            *actions,
+            *actions[index:],
+        ]
+    return actions
+
+
+def feedback_mentions_ik_failure(feedback: str) -> bool:
+    lowered = feedback.lower()
+    return "ik could not solve" in lowered or "ik failed" in lowered
+
+
+def ensure_homing_before_ik_retry(
+    actions: list[PrimitiveAction],
+    snapshot: dict[str, Any],
+    feedback: str,
+) -> list[PrimitiveAction]:
+    if not actions or not feedback_mentions_ik_failure(feedback):
+        return actions
+    for index, action in enumerate(actions):
+        if not action_is_object_descent_before_grip(actions, index, snapshot):
+            continue
+        if index > 0 and actions[index - 1].action == ACTION_HOMING:
+            return actions
+        return [
+            *actions[:index],
+            PrimitiveAction(
+                robot_id=action.robot_id,
+                action=ACTION_HOMING,
+                target_pose=None,
+                target_object_id=None,
+            ),
+            *actions[index:],
         ]
     return actions
 
@@ -1577,6 +1927,283 @@ def infer_task_object_id(task: str, snapshot: dict[str, Any]) -> str | None:
     if len(matches) == 1:
         return matches[0]
     return None
+
+
+GOAL_COLOR_TERMS = {
+    "red": (
+        "red_goal",
+        "red goal",
+        "red target",
+        "빨간 목표",
+        "빨강 목표",
+        "빨간색 목표",
+    ),
+    "blue": (
+        "blue_goal",
+        "blue goal",
+        "blue target",
+        "파란 목표",
+        "파랑 목표",
+        "파란색 목표",
+    ),
+}
+OBJECT_COLOR_TERMS = {
+    "red": ("red object", "red objects", "빨간 물체", "빨강 물체", "빨간색 물체"),
+    "blue": ("blue object", "blue objects", "파란 물체", "파랑 물체", "파란색 물체"),
+}
+ALL_OBJECT_TERMS = ("all objects", "every object", "모든 물체", "전체 물체")
+COLOR_SORT_TERMS = (
+    "sort by color",
+    "color sort",
+    "color sorting",
+    "색상별",
+    "색깔별",
+    "색 별",
+    "정렬",
+)
+
+
+def command_mentions_any(command: str, terms: tuple[str, ...]) -> bool:
+    lowered = command.lower()
+    return any(term in lowered for term in terms)
+
+
+def mentioned_goal_colors(command: str) -> set[str]:
+    return {
+        color
+        for color, terms in GOAL_COLOR_TERMS.items()
+        if command_mentions_any(command, terms)
+    }
+
+
+def mentioned_object_colors(command: str) -> set[str]:
+    return {
+        color
+        for color, terms in OBJECT_COLOR_TERMS.items()
+        if command_mentions_any(command, terms)
+    }
+
+
+def command_has_all_objects(command: str) -> bool:
+    return command_mentions_any(command, ALL_OBJECT_TERMS)
+
+
+def command_maps_object_color_to_goal(
+    command: str, object_color: str, goal_color: str
+) -> bool:
+    lowered = command.lower()
+    object_terms = OBJECT_COLOR_TERMS.get(object_color, ())
+    goal_terms = GOAL_COLOR_TERMS.get(goal_color, ())
+    other_object_terms = [
+        term
+        for color, terms in OBJECT_COLOR_TERMS.items()
+        if color != object_color
+        for term in terms
+    ]
+    for object_term in object_terms:
+        start = lowered.find(object_term)
+        while start >= 0:
+            end = min(len(lowered), start + 80)
+            for other_term in other_object_terms:
+                other_start = lowered.find(other_term, start + len(object_term), end)
+                if other_start >= 0:
+                    end = min(end, other_start)
+            clause = lowered[start:end]
+            if any(goal_term in clause for goal_term in goal_terms):
+                return True
+            start = lowered.find(object_term, start + len(object_term))
+    return False
+
+
+def command_goal_assignments(command: str, snapshot: dict[str, Any]) -> dict[str, str]:
+    objects = (
+        snapshot.get("objects") if isinstance(snapshot.get("objects"), list) else []
+    )
+    object_entries = [obj for obj in objects if isinstance(obj, dict) and obj.get("id")]
+    goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+    available_goal_colors = {
+        color for color in goals if color in CONTROL_GOAL_TARGETS
+    } or set(CONTROL_GOAL_TARGETS)
+    goal_colors = mentioned_goal_colors(command) & available_goal_colors
+    object_colors = mentioned_object_colors(command)
+    all_objects = command_has_all_objects(command)
+
+    if len(goal_colors) == 1:
+        destination_color = next(iter(goal_colors))
+        selected_colors = {
+            str(obj.get("color") or "")
+            for obj in object_entries
+            if all_objects
+            or not object_colors
+            or str(obj.get("color") or "") in object_colors
+        }
+        return {
+            str(obj["id"]): destination_color
+            for obj in object_entries
+            if str(obj.get("color") or "") in selected_colors
+        }
+
+    explicit_color_map: dict[str, str] = {}
+    for object_color in OBJECT_COLOR_TERMS:
+        for goal_color in GOAL_COLOR_TERMS:
+            if goal_color not in available_goal_colors:
+                continue
+            if command_maps_object_color_to_goal(command, object_color, goal_color):
+                explicit_color_map[object_color] = goal_color
+
+    if explicit_color_map:
+        return {
+            str(obj["id"]): explicit_color_map[color]
+            for obj in object_entries
+            for color in [str(obj.get("color") or "")]
+            if color in explicit_color_map
+        }
+
+    if object_colors and goal_colors and object_colors == goal_colors:
+        return {
+            str(obj["id"]): color
+            for obj in object_entries
+            for color in [str(obj.get("color") or "")]
+            if color in object_colors and color in available_goal_colors
+        }
+
+    return {}
+
+
+def task_goal_color(task: str, snapshot: dict[str, Any]) -> str | None:
+    lowered = task.lower()
+    for color, terms in GOAL_COLOR_TERMS.items():
+        if any(term in lowered for term in terms):
+            return color
+    goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+    for color, goal in goals.items():
+        if isinstance(goal, dict) and goal.get("id") and str(goal["id"]) in task:
+            return str(color)
+    return None
+
+
+def object_in_goal(
+    snapshot: dict[str, Any], object_id: str | None, goal_color: str | None
+) -> bool:
+    return object_stably_at_goal(snapshot, object_id, goal_color)
+
+
+def object_near_any_eef(snapshot: dict[str, Any], object_id: str | None) -> bool:
+    obj = object_by_id(snapshot, object_id)
+    if not isinstance(obj, dict):
+        return False
+    robots = snapshot.get("robots") if isinstance(snapshot.get("robots"), dict) else {}
+    for robot in robots.values():
+        if not isinstance(robot, dict):
+            continue
+        error = pose_error(robot.get("end_effector_pose"), obj.get("pose"))
+        if not isinstance(error, dict):
+            continue
+        if (
+            error["xy"] <= OBJECT_EEF_DETACHED_XY_MIN
+            and error["z_abs"] <= OBJECT_EEF_DETACHED_Z_MIN
+        ):
+            return True
+    return False
+
+
+def object_held_by_any_robot(snapshot: dict[str, Any], object_id: str | None) -> bool:
+    robots = snapshot.get("robots") if isinstance(snapshot.get("robots"), dict) else {}
+    return any(
+        robot_appears_to_hold_object(snapshot, str(robot_id), object_id)
+        for robot_id in robots
+    )
+
+
+def object_resting_near_z(
+    snapshot: dict[str, Any],
+    object_id: str | None,
+    support_z: float | None,
+) -> bool:
+    obj = object_by_id(snapshot, object_id)
+    point = pose_position(obj.get("pose") if isinstance(obj, dict) else None)
+    if point is None or support_z is None:
+        return False
+    return abs(point["z"] - support_z) <= OBJECT_SUPPORT_Z_TOL
+
+
+def goal_support_z(goal_color: str | None) -> float | None:
+    if goal_color in CONTROL_GOAL_TARGETS:
+        return float(CONTROL_GOAL_TARGETS[goal_color]["z"])
+    return None
+
+
+def object_stably_at_goal(
+    snapshot: dict[str, Any], object_id: str | None, goal_color: str | None
+) -> bool:
+    if goal_color is None:
+        return False
+    obj = object_by_id(snapshot, object_id)
+    if not isinstance(obj, dict):
+        return False
+    goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+    goal = goals.get(goal_color)
+    if not isinstance(goal, dict):
+        return False
+    return (
+        bool(goal_containing_pose(obj.get("pose"), {goal_color: goal}))
+        and object_resting_near_z(snapshot, object_id, goal_support_z(goal_color))
+        and not object_near_any_eef(snapshot, object_id)
+        and not object_held_by_any_robot(snapshot, object_id)
+    )
+
+
+def object_at_handover(snapshot: dict[str, Any], object_id: str | None) -> bool:
+    obj = object_by_id(snapshot, object_id)
+    if not isinstance(obj, dict):
+        return False
+    summary = build_agent_world_summary(snapshot)
+    handover = (
+        summary.get("named_locations", {}).get("table_center_handover")
+        if isinstance(summary.get("named_locations"), dict)
+        else None
+    )
+    handover_pose = handover.get("pose") if isinstance(handover, dict) else None
+    distance = xy_distance(obj.get("pose"), handover_pose)
+    return (
+        isinstance(distance, (int, float))
+        and distance <= HANDOVER_TARGET_XY_TOL
+        and object_resting_near_z(
+            snapshot, object_id, float(CONTROL_TABLE_CENTER_TARGET["z"])
+        )
+        and not object_near_any_eef(snapshot, object_id)
+        and not object_held_by_any_robot(snapshot, object_id)
+    )
+
+
+def object_near_support_location(
+    snapshot: dict[str, Any], object_id: str | None
+) -> bool:
+    obj = object_by_id(snapshot, object_id)
+    if not isinstance(obj, dict):
+        return False
+    summary = build_agent_world_summary(snapshot)
+    handover = (
+        summary.get("named_locations", {}).get("table_center_handover")
+        if isinstance(summary.get("named_locations"), dict)
+        else None
+    )
+    handover_pose = handover.get("pose") if isinstance(handover, dict) else None
+    handover_distance = xy_distance(obj.get("pose"), handover_pose)
+    if (
+        isinstance(handover_distance, (int, float))
+        and handover_distance <= HANDOVER_TARGET_XY_TOL
+    ):
+        return True
+    goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+    return goal_containing_pose(obj.get("pose"), goals, margin=0.04) is not None
+
+
+def task_destination_kind(task: str) -> str:
+    lowered = task.lower()
+    if "table_center_handover" in lowered and "goal" not in lowered:
+        return "handover"
+    return "goal"
 
 
 def normalize_action_target_object_ids(
@@ -1596,6 +2223,8 @@ def normalize_action_target_object_ids(
     normalized: list[PrimitiveAction] = []
     for action in actions:
         target_object_id = action.target_object_id
+        if action.action != ACTION_HOMING and target_object_id is None:
+            target_object_id = task_object_id
         if action.action != ACTION_HOMING and target_object_id in goal_ids:
             target_object_id = task_object_id
         normalized.append(
@@ -1609,20 +2238,80 @@ def normalize_action_target_object_ids(
     return normalized
 
 
+def normalize_action_robot_ids(
+    actions: list[PrimitiveAction],
+    task: str,
+    snapshot: dict[str, Any],
+) -> list[PrimitiveAction]:
+    task_robot_id = infer_task_robot_id(task, snapshot)
+    if task_robot_id not in CONTROL_SERVICE_TOPICS:
+        return actions
+    return [
+        PrimitiveAction(
+            robot_id=task_robot_id,
+            action=action.action,
+            target_pose=action.target_pose,
+            target_object_id=action.target_object_id,
+        )
+        for action in actions
+    ]
+
+
 def infer_task_robot_id(task: str, snapshot: dict[str, Any]) -> str | None:
     lowered = task.lower()
     for robot_id in CONTROL_SERVICE_TOPICS:
-        if f"{robot_id} robot" in lowered or f"robot {robot_id}" in lowered:
+        if re.search(rf"\b{re.escape(robot_id)}\s+robot\s+move\b", lowered):
             return robot_id
+        if re.search(rf"\brobot\s+{re.escape(robot_id)}\s+move\b", lowered):
+            return robot_id
+    mentioned_robot_ids = [
+        robot_id
+        for robot_id in CONTROL_SERVICE_TOPICS
+        if f"{robot_id} robot" in lowered or f"robot {robot_id}" in lowered
+    ]
+    if len(mentioned_robot_ids) == 1:
+        return mentioned_robot_ids[0]
     object_id = infer_task_object_id(task, snapshot)
     if object_id is not None:
-        summary = build_agent_world_summary(snapshot)
-        obj = summary.get("objects_by_id", {}).get(object_id)
-        if isinstance(obj, dict):
-            preferred = obj.get("preferred_direct_robot") or obj.get("nearest_robot")
-            if preferred in CONTROL_SERVICE_TOPICS:
-                return str(preferred)
+        goal_color = task_goal_color(task, snapshot)
+        preferred = preferred_robot_for_task_destination(snapshot, object_id, goal_color)
+        if preferred in CONTROL_SERVICE_TOPICS:
+            return preferred
     return None
+
+
+def preferred_robot_for_task_destination(
+    snapshot: dict[str, Any], object_id: str, goal_color: str | None
+) -> str | None:
+    summary = build_agent_world_summary(
+        snapshot, {object_id: goal_color} if goal_color is not None else None
+    )
+    obj = summary.get("objects_by_id", {}).get(object_id)
+    if not isinstance(obj, dict):
+        return None
+    if goal_color is None:
+        preferred = obj.get("preferred_direct_robot") or obj.get("nearest_robot")
+        return str(preferred) if preferred in CONTROL_SERVICE_TOPICS else None
+    goals = summary.get("goals") if isinstance(summary.get("goals"), dict) else {}
+    goal = goals.get(goal_color)
+    object_reach = obj.get("reach") if isinstance(obj.get("reach"), dict) else {}
+    goal_reach = goal.get("reach") if isinstance(goal, dict) else {}
+    direct_candidates = [
+        robot_id
+        for robot_id in CONTROL_SERVICE_TOPICS
+        if reach_is_usable(object_reach.get(robot_id))
+        and isinstance(goal_reach, dict)
+        and reach_is_usable(goal_reach.get(robot_id))
+    ]
+    destination_robot = goal.get("nearest_robot") if isinstance(goal, dict) else None
+    pickup_robot = obj.get("nearest_robot")
+    if destination_robot in direct_candidates:
+        return str(destination_robot)
+    if pickup_robot in direct_candidates:
+        return str(pickup_robot)
+    if direct_candidates:
+        return str(direct_candidates[0])
+    return str(pickup_robot) if pickup_robot in CONTROL_SERVICE_TOPICS else None
 
 
 def infer_task_destination(
@@ -1630,17 +2319,37 @@ def infer_task_destination(
 ) -> tuple[str, dict[str, Any]] | None:
     lowered = task.lower()
     object_id = infer_task_object_id(task, snapshot)
-    summary = build_agent_world_summary(snapshot) if object_id is not None else {}
+    explicit_goal_color = task_goal_color(task, snapshot)
+    summary = (
+        build_agent_world_summary(
+            snapshot,
+            {object_id: explicit_goal_color}
+            if object_id is not None and explicit_goal_color is not None
+            else None,
+        )
+        if object_id is not None
+        else {}
+    )
     summary_obj = (
         summary.get("objects_by_id", {}).get(object_id)
         if isinstance(summary.get("objects_by_id"), dict)
         else None
     )
     for color, target in CONTROL_GOAL_TARGETS.items():
-        if f"{color}_goal" in lowered or f"{color} goal" in lowered:
+        if any(term in lowered for term in GOAL_COLOR_TERMS.get(color, ())):
+            by_color = (
+                summary_obj.get("recommended_goal_drop_poses_by_color")
+                if isinstance(summary_obj, dict)
+                and isinstance(
+                    summary_obj.get("recommended_goal_drop_poses_by_color"), dict
+                )
+                else {}
+            )
+            if isinstance(by_color.get(color), dict):
+                return ACTION_PLACING, by_color[color]
             if (
                 isinstance(summary_obj, dict)
-                and summary_obj.get("target_goal_color") == color
+                and summary_obj.get("default_same_color_goal") == color
                 and isinstance(summary_obj.get("recommended_goal_drop_pose"), dict)
             ):
                 return ACTION_PLACING, summary_obj["recommended_goal_drop_pose"]
@@ -1654,7 +2363,7 @@ def infer_task_destination(
             return ACTION_CENTERING, summary_obj["recommended_handover_drop_pose"]
         return ACTION_CENTERING, pose_with_position(CONTROL_TABLE_CENTER_TARGET)
     if object_id is not None and isinstance(summary_obj, dict):
-        color = str(summary_obj.get("target_goal_color") or "")
+        color = str(summary_obj.get("requested_goal_color") or summary_obj.get("default_same_color_goal") or "")
         if color in CONTROL_GOAL_TARGETS:
             recommended_pose = summary_obj.get("recommended_goal_drop_pose")
             if isinstance(recommended_pose, dict):
@@ -1685,7 +2394,7 @@ def canonical_control_action_plan(
             PrimitiveAction(robot_id, ACTION_RELEASE, None, object_id),
             PrimitiveAction(robot_id, ACTION_HOMING, None, None),
         ]
-    return ensure_release_before_closed_gripper_descent(
+    return ensure_release_before_object_descent(
         [
             PrimitiveAction(robot_id, ACTION_MOVING, object_pose, object_id),
             PrimitiveAction(robot_id, ACTION_GRIP, None, object_id),
@@ -1695,6 +2404,104 @@ def canonical_control_action_plan(
         ],
         snapshot,
     )
+
+
+def apply_alternate_destination_slot(
+    actions: list[PrimitiveAction],
+    task: str,
+    snapshot: dict[str, Any],
+    attempt_offset: int,
+) -> list[PrimitiveAction]:
+    if attempt_offset <= 0:
+        return actions
+    object_id = infer_task_object_id(task, snapshot)
+    if object_id is None:
+        return actions
+    replacement_pose: dict[str, Any] | None = None
+    goal_color = task_goal_color(task, snapshot)
+    summary = build_agent_world_summary(
+        snapshot, {object_id: goal_color} if goal_color is not None else None
+    )
+    if goal_color is not None:
+        goal = (
+            summary.get("goals", {}).get(goal_color)
+            if isinstance(summary.get("goals"), dict)
+            else None
+        )
+        slots = goal.get("placement_slots") if isinstance(goal, dict) else None
+        if isinstance(slots, list) and slots:
+            slot_index = (
+                stable_slot_index(object_id, len(slots)) + attempt_offset
+            ) % len(slots)
+            replacement_pose = slots[slot_index]
+    elif task_destination_kind(task) == "handover":
+        handover = (
+            summary.get("named_locations", {}).get("table_center_handover")
+            if isinstance(summary.get("named_locations"), dict)
+            else None
+        )
+        slots = handover.get("drop_slots") if isinstance(handover, dict) else None
+        if isinstance(slots, list) and slots:
+            slot_index = (
+                stable_slot_index(object_id, len(slots)) + attempt_offset
+            ) % len(slots)
+            replacement_pose = slots[slot_index]
+    if replacement_pose is None:
+        return actions
+    adjusted: list[PrimitiveAction] = []
+    for action in actions:
+        if action.action in {ACTION_CENTERING, ACTION_PLACING}:
+            adjusted.append(
+                PrimitiveAction(
+                    robot_id=action.robot_id,
+                    action=action.action,
+                    target_pose=replacement_pose,
+                    target_object_id=action.target_object_id,
+                )
+            )
+        else:
+            adjusted.append(action)
+    return adjusted
+
+
+def resolve_action_for_fresh_snapshot(
+    action: PrimitiveAction,
+    task: str,
+    snapshot: dict[str, Any],
+    attempt_offset: int = 0,
+) -> PrimitiveAction:
+    if action.action == ACTION_MOVING and action.target_object_id:
+        obj = object_by_id(snapshot, action.target_object_id)
+        object_pose = (
+            control_pose_from_pose(obj.get("pose")) if isinstance(obj, dict) else None
+        )
+        if object_pose is not None:
+            return PrimitiveAction(
+                robot_id=action.robot_id,
+                action=action.action,
+                target_pose=object_pose,
+                target_object_id=action.target_object_id,
+            )
+    if action.action in {ACTION_CENTERING, ACTION_PLACING}:
+        resolved = apply_alternate_destination_slot(
+            [action], task, snapshot, attempt_offset
+        )[0]
+        destination = infer_task_destination(task, snapshot)
+        if destination is None:
+            return resolved
+        destination_action, destination_pose = destination
+        if action.action == destination_action:
+            resolved = PrimitiveAction(
+                robot_id=action.robot_id,
+                action=action.action,
+                target_pose=destination_pose,
+                target_object_id=action.target_object_id,
+            )
+            resolved = apply_alternate_destination_slot(
+                [resolved], task, snapshot, attempt_offset
+            )[0]
+        return resolved
+    return action
 
 
 def action_sequence_label(actions: list[PrimitiveAction]) -> str:
@@ -1820,19 +2627,25 @@ class TaskAgent(Agent):
     def decompose(
         self, command: str, snapshot: dict[str, Any], image_bytes: bytes | None
     ) -> list[str]:
+        goal_assignments = command_goal_assignments(command, snapshot)
         reply = self.call_json(
             {
                 "user_command": command,
-                "world_summary": build_agent_world_summary(snapshot),
+                "world_summary": build_agent_world_summary(
+                    snapshot, goal_assignments
+                ),
+                "interpreted_goal_assignments": goal_assignments,
                 "task_rules": [
                     "Create one task for each object that still needs to be moved.",
                     "Each task must contain the exact object id, responsible robot_id if inferable, and destination.",
-                    "Use red_goal for red objects and blue_goal for blue objects.",
+                    "Obey the user's requested destination. Do not rewrite a requested single destination into color-matched destinations.",
+                    "If interpreted_goal_assignments is non-empty, use those object_id -> goal_color destinations exactly.",
+                    "Use red_goal for red objects and blue_goal for blue objects only when the user asks for color matching/sorting or gives no different destination.",
                     "Use world_summary.objects_by_id[*].preferred_direct_robot for ordinary direct tasks.",
-                    "If an object is already inside its matching color goal region, do not create a task for that object.",
-                    "If direct_robot_candidates is non-empty or preferred_direct_robot is present, create a single direct task to the final color goal; do not insert table_center_handover.",
-                    "Create one direct task using the preferred robot and the final color goal unless feedback says a direct attempt already failed.",
-                    "If preferred_direct_robot is absent, direct_robot_candidates is empty, and nearest_robot differs from destination_nearest_robot, split into two tasks: pickup robot moves object to table_center_handover, then destination robot moves it from that location to the final goal.",
+                    "If an object is already inside its requested destination goal region, do not create a task for that object.",
+                    "If direct_robot_candidates is non-empty or preferred_direct_robot is present for the requested destination, create a single direct task to the final requested goal; do not insert table_center_handover.",
+                    "Create one direct task using the preferred robot and the final requested goal unless feedback says a direct attempt already failed.",
+                    "If no robot can directly cover both pickup and requested destination, split into two tasks: pickup robot moves object to table_center_handover, then destination robot moves it from that location to the requested final goal.",
                     "When a direct attempt actually failed, also split into the same table_center_handover route instead of repeating the unreachable direct placement.",
                     "For recovery staged tasks, include the handover source/destination in natural language so the ActionAgent knows whether it is picking from the object's original pose or from a buffer.",
                     "The destination may be a goal, table_center_handover, or another named_locations entry when handover/buffer is needed.",
@@ -1874,10 +2687,33 @@ class ActionAgent(Agent):
         image_bytes: bytes | None,
         feedback: str = "",
     ) -> list[PrimitiveAction]:
+        object_id = infer_task_object_id(task, snapshot)
+        goal_color = task_goal_color(task, snapshot)
+        requested_assignments = (
+            {object_id: goal_color}
+            if object_id is not None and goal_color is not None
+            else None
+        )
+        world_summary = build_agent_world_summary(snapshot, requested_assignments)
+        if object_id is not None and goal_color is not None:
+            summary_obj = (
+                world_summary.get("objects_by_id", {}).get(object_id)
+                if isinstance(world_summary.get("objects_by_id"), dict)
+                else None
+            )
+            if (
+                not isinstance(summary_obj, dict)
+                or summary_obj.get("requested_goal_color") is None
+                or summary_obj.get("requested_goal_id") is None
+            ):
+                raise ValueError(
+                    "ActionAgent input is missing requested_goal_color/requested_goal_id "
+                    f"for {object_id}; rebuild world_summary with the task's requested goal."
+                )
         reply = self.call_json(
             {
                 "task": task,
-                "world_summary": build_agent_world_summary(snapshot),
+                "world_summary": world_summary,
                 "feedback": feedback,
                 "allowed_actions": sorted(ALLOWED_ACTIONS),
                 "action_rules": [
@@ -1885,7 +2721,7 @@ class ActionAgent(Agent):
                     "If the task names a responsible robot_id such as 'left robot' or 'right robot', use that robot_id for the whole primitive sequence unless feedback says to reassign.",
                     "Default to the baseline ControlCommand workflow: Moving(object pose), Grip, then Placing for a color goal or Centering for table_center_handover, Release, Homing.",
                     "Use Placing for red_goal or blue_goal. Use Centering for table_center or table_center_handover.",
-                    "For Placing, prefer world_summary.objects_by_id[object_id].recommended_goal_drop_pose so repeated same-color objects do not all target the exact same XY; if absent, use world_summary.control_service_contract.goal_targets[color].",
+                    "For Placing, use the task's destination goal color, not necessarily the object's color. Prefer world_summary.objects_by_id[object_id].recommended_goal_drop_poses_by_color[destination_color]; if absent, use control_service_contract.goal_targets[destination_color].",
                     "For Centering to table_center_handover, prefer world_summary.objects_by_id[object_id].recommended_handover_drop_pose or the named location drop_slots; if absent, use control_service_contract.table_center_target.",
                     "If the task destination is world_summary.named_locations.<name>, use Centering or that named location pose as the stage drop target rather than the final color goal.",
                     "If the task says the object is coming from a named handover location, still use the object's current observed marker pose as the pre-grasp Moving target.",
@@ -1893,8 +2729,9 @@ class ActionAgent(Agent):
                     "Do not move to the goal before Grip.",
                     "Do not add extra lift, approach, clearance, or descent waypoints. world.py enforces vertical rise, high-Z horizontal travel, vertical descent, and small final XY variation for Moving, Centering, and Placing.",
                     "Return enough actions to accomplish the current task; do not assume the runtime will ask you for the missing primitives of the same task.",
-                    "The final primitive must be Homing with target_pose null and target_object_id null.",
-                    "If feedback indicates failed grasp/slip/retry and the selected robot gripper is closed or partially closed, Release before Moving down to an object.",
+                    "The final primitive must be Homing with target_pose null and target_object_id null. If feedback says IK failed and the same robot is still plausible, the sequence may also begin with a Homing recovery primitive before retrying Moving.",
+                    "Before a new grasp attempt, use Release only to clear an empty/stale gripper. If the object is still held, first move it to a valid goal or table_center_handover support pose; do not drop it mid-transfer.",
+                    "If feedback says IK could not solve a movement target, first check whether the task's robot_id conflicts with world_summary.objects_by_id[object_id].preferred_direct_robot or direct_robot_candidates. If the robot is plausible, start the recovery sequence with Homing for that robot, then retry Moving to the object's current observed pose. If the robot is not plausible, reassign the stage or use table_center_handover.",
                     "Do not use a goal marker id as target_object_id.",
                     "Even when target_pose is a goal or named destination pose, target_object_id must remain the manipulated object id from the task.",
                     "Use 'Release' exactly for opening the gripper.",
@@ -1918,8 +2755,10 @@ class ActionAgent(Agent):
             raise ValueError("ActionAgent response must contain non-empty actions list")
         actions = [parse_primitive_action(item) for item in raw_actions]
         actions = normalize_action_target_object_ids(actions, task, snapshot)
-        actions = ensure_release_before_closed_gripper_descent(actions, snapshot)
-        validate_action_sequence_against_snapshot(actions, snapshot)
+        actions = normalize_action_robot_ids(actions, task, snapshot)
+        actions = ensure_release_before_object_descent(actions, snapshot)
+        actions = ensure_homing_before_ik_retry(actions, snapshot, feedback)
+        validate_action_sequence_for_task(actions, task, snapshot)
         return actions
 
 
@@ -1931,7 +2770,7 @@ class TroubleshooterAgent(Agent):
                 "You are the Troubleshooter agent. Diagnose one primitive using before/after ROS2 snapshots and the planned sequence. "
                 "Return only one allowed status from the payload. For non-final primitives, never return complete. "
                 "Use execution_diagnostics, sequence_context, and agent_context for domain rules; do not rely on service success alone. "
-                'Return JSON only: {"status": "success"|"pending"|"retry"|"replan_task"|'
+                'Return JSON only: {"status": "success"|"retry"|"replan_task"|'
                 '"replan_all"|"emergency_recover"|"complete", "message": string}.'
             ),
         )
@@ -1946,25 +2785,25 @@ class TroubleshooterAgent(Agent):
         total_actions: int,
         previous_actions: list[dict[str, Any]],
         remaining_actions: list[dict[str, Any]],
-        pending_check_count: int = 0,
     ) -> dict[str, Any]:
         execution_diagnostics = build_execution_diagnostics(result, snapshot_after)
-        motion_pending = (
-            execution_diagnostics.get("moving_temporal_assessment", {}).get(
-                "still_active"
-            )
-            is True
+        object_id = infer_task_object_id(task, snapshot_after)
+        goal_color = task_goal_color(task, snapshot_after)
+        requested_assignments = (
+            {object_id: goal_color}
+            if object_id is not None and goal_color is not None
+            else None
         )
         allowed_statuses = sorted(TROUBLESHOOTER_STATUSES)
-        if motion_pending:
-            allowed_statuses = ["pending"]
         reply = self.call_json(
             {
                 "task": task,
                 "action_result": result.as_dict(),
                 "snapshot_before": result.snapshot_before,
                 "snapshot_after": snapshot_after,
-                "world_summary_after": build_agent_world_summary(snapshot_after),
+                "world_summary_after": build_agent_world_summary(
+                    snapshot_after, requested_assignments
+                ),
                 "execution_diagnostics": execution_diagnostics,
                 "task_context": {
                     "natural_language_task": task,
@@ -1990,12 +2829,10 @@ class TroubleshooterAgent(Agent):
                     "total_actions": total_actions,
                     "is_final_action": action_index >= total_actions,
                     "remaining_actions": remaining_actions,
-                    "pending_check_count": pending_check_count,
                     "rule": (
                         "Do not return complete before the final action. "
                         "Intermediate successful primitives should return success so runtime continues the sequence. "
-                        "Return pending when the action may still be settling and the relaxed EEF tolerance has not been reached. "
-                        "If moving_temporal_assessment.still_active is true, pending is the only valid diagnosis."
+                        "Pending is disabled; return success for transient settling unless there is a clear retry/replan condition."
                     ),
                 },
                 "allowed_status": allowed_statuses,
@@ -2003,13 +2840,6 @@ class TroubleshooterAgent(Agent):
             image_bytes=image_bytes,
         )
         status = str(reply.parsed.get("status") or "").strip()
-        if motion_pending and status != "pending":
-            reply.parsed["status"] = "pending"
-            reply.parsed["message"] = (
-                "Runtime corrected Troubleshooter status to pending because the Moving action is still active. "
-                + str(reply.parsed.get("message", ""))
-            )
-            status = "pending"
         if status not in TROUBLESHOOTER_STATUSES:
             raise ValueError(f"TroubleshooterAgent returned invalid status: {status!r}")
         return reply.parsed
@@ -2021,7 +2851,8 @@ class MainAgent(Agent):
             "main",
             (
                 "You coordinate Task, Action, DB, and Troubleshooter agents. "
-                "You decide whether the entire user command is complete or whether to continue/retry/replan. "
+                "You provide advisory opinions about whether the entire user command is complete or whether to continue/retry/replan. "
+                "The deterministic runtime, not you, chooses the next task index. "
                 "Do not treat a primitive success report as task completion unless the current world summary shows the task-level object/goal state is satisfied. "
                 "Use Troubleshooter reports as evidence, but verify against object poses, goals, gripper states, and the remaining task list. "
                 "Return JSON only when asked."
@@ -2043,11 +2874,12 @@ class MainAgent(Agent):
                 "tasks": tasks,
                 "completed_tasks": completed_tasks,
                 "world_snapshot": snapshot,
-                "world_summary": build_agent_world_summary(snapshot),
+                "world_summary": build_agent_world_summary(
+                    snapshot, command_goal_assignments(command, snapshot)
+                ),
                 "troubleshooter_reports": troubleshooter_reports[-10:],
                 "required_output": {
                     "complete": "boolean",
-                    "next_task_index": "integer or null",
                     "decision": "continue|retry|replan_task|replan_all|emergency_recover|complete",
                     "message": "string",
                 },
@@ -2387,14 +3219,155 @@ class ActionExecutor:
             return ActionResult(
                 False, f"Invalid robot_id: {action.robot_id}", action, before, before
             )
+        if action.action in {ACTION_CENTERING, ACTION_PLACING}:
+            if not robot_appears_to_hold_object(
+                before, action.robot_id, action.target_object_id
+            ):
+                return ActionResult(
+                    False,
+                    (
+                        f"{action.action} blocked: {action.robot_id} is not holding "
+                        f"{action.target_object_id}. Replan from fresh state with "
+                        "Release cleanup if needed, Moving(current object pose), Grip, "
+                        f"then {action.action}."
+                    ),
+                    action,
+                    before,
+                    before,
+                )
+        if action.action == ACTION_RELEASE and action.target_object_id:
+            held = robot_appears_to_hold_object(
+                before, action.robot_id, action.target_object_id
+            )
+            safe_support = object_near_support_location(before, action.target_object_id)
+            if held and not safe_support:
+                return ActionResult(
+                    False,
+                    (
+                        "Release blocked: object appears held but is not near a "
+                        "goal or table_center_handover support location."
+                    ),
+                    action,
+                    before,
+                    before,
+                )
         if action.action == ACTION_GRIP:
             ready, message, before = self._wait_for_grip_precondition(action, before)
             if not ready:
                 return ActionResult(False, message, action, before, before)
         success, message = self.db_node.call_control_service(action)
         self._action_interval(action.action)
+        if success and action.action == ACTION_RELEASE:
+            opened, verify_message, after = self._wait_for_release_open(action)
+            return ActionResult(
+                opened,
+                f"Release command accepted: {message}. {verify_message}",
+                action,
+                before,
+                after,
+            )
+        if success and action.action in MOVEMENT_ACTIONS:
+            _, wait_message, after = self._wait_for_movement_observation(action)
+            return ActionResult(
+                True,
+                f"{message}. {wait_message}",
+                action,
+                before,
+                after,
+            )
         after, _ = self.db_node.snapshot(include_image=False)
         return ActionResult(success, message, action, before, after)
+
+    def _wait_for_release_open(
+        self, action: PrimitiveAction
+    ) -> tuple[bool, str, dict[str, Any]]:
+        deadline = time.monotonic() + RELEASE_VERIFY_TIMEOUT_SEC
+        last_snapshot, _ = self.db_node.snapshot(include_image=False)
+        last_gripper: dict[str, Any] = {}
+        reported = False
+        while rclpy.ok() and time.monotonic() <= deadline:
+            snapshot, _ = self.db_node.snapshot(include_image=False)
+            last_snapshot = snapshot
+            robot = robot_by_id(snapshot, action.robot_id)
+            gripper = gripper_summary((robot or {}).get("joint_state"))
+            last_gripper = gripper
+            mean_position = gripper.get("mean_finger_position")
+            mean_velocity = gripper.get("mean_finger_velocity")
+            open_enough = (
+                isinstance(mean_position, (int, float))
+                and float(mean_position) >= GRIPPER_OPEN_POSITION_MIN
+            )
+            settled = (
+                not isinstance(mean_velocity, (int, float))
+                or float(mean_velocity) <= GRIPPER_OPEN_VERIFY_VELOCITY_TOL
+            )
+            if open_enough and settled:
+                return (
+                    True,
+                    "Release opening verified from fresh finger joint state.",
+                    snapshot,
+                )
+            if not reported:
+                self.reporter.status(
+                    "Release wait",
+                    {
+                        "robot_id": action.robot_id,
+                        "target_object_id": action.target_object_id,
+                        "timeout_sec": RELEASE_VERIFY_TIMEOUT_SEC,
+                    },
+                )
+                reported = True
+            time.sleep(0.1)
+        return (
+            False,
+            (
+                "Release opening was not verified before timeout; "
+                f"last_gripper={last_gripper}."
+            ),
+            last_snapshot,
+        )
+
+    def _wait_for_movement_observation(
+        self, action: PrimitiveAction
+    ) -> tuple[bool, str, dict[str, Any]]:
+        deadline = time.monotonic() + MOVEMENT_VERIFY_TIMEOUT_SEC
+        last_snapshot, _ = self.db_node.snapshot(include_image=False)
+        reported = False
+        while rclpy.ok() and time.monotonic() <= deadline:
+            snapshot, _ = self.db_node.snapshot(include_image=False)
+            last_snapshot = snapshot
+            robot = robot_by_id(snapshot, action.robot_id)
+            eef_pose = (robot or {}).get("end_effector_pose")
+            arm_motion = arm_joint_motion_summary((robot or {}).get("joint_state"))
+            reached = pose_reached(
+                eef_pose,
+                action.target_pose,
+                xy_tol=EEF_REACHED_RELAXED_XY_TOL,
+                z_tol=EEF_REACHED_RELAXED_Z_TOL,
+            )
+            if reached or arm_motion.get("appears_moving") is not True:
+                return (
+                    True,
+                    "Fresh movement observation is settled or target is reached.",
+                    snapshot,
+                )
+            if not reported:
+                self.reporter.status(
+                    "Movement wait",
+                    {
+                        "robot_id": action.robot_id,
+                        "action": action.action,
+                        "target_object_id": action.target_object_id,
+                        "timeout_sec": MOVEMENT_VERIFY_TIMEOUT_SEC,
+                    },
+                )
+                reported = True
+            time.sleep(0.1)
+        return (
+            False,
+            "Movement still appeared active after wait; downstream verifier will use the fresh snapshot.",
+            last_snapshot,
+        )
 
     def _wait_for_grip_precondition(
         self, action: PrimitiveAction, initial_snapshot: dict[str, Any]
@@ -2497,6 +3470,9 @@ def wait_for_ready(db_node: DBRosNode, reporter: Reporter) -> None:
 
 
 def ask_user_command() -> str:
+    if MODE.strip().lower() == "auto":
+        print(f"Auto command: {AUTO_COMMAND}")
+        return AUTO_COMMAND
     if RICH_AVAILABLE and Prompt is not None:
         text = Prompt.ask(
             "Command", default=DEFAULT_COMMAND if USE_DEFAULT_ON_EMPTY_INPUT else ""
@@ -2541,10 +3517,26 @@ def requested_sort_colors(command: str) -> set[str]:
     return colors
 
 
+def command_requests_color_sort(command: str) -> bool:
+    return command_mentions_any(command, COLOR_SORT_TERMS)
+
+
 def color_sort_completion_status(
     command: str, snapshot: dict[str, Any]
 ) -> tuple[bool | None, list[str]]:
+    assignments = command_goal_assignments(command, snapshot)
+    if assignments:
+        missing = [
+            object_id
+            for object_id, goal_color in assignments.items()
+            if not object_in_goal(snapshot, object_id, goal_color)
+        ]
+        return not missing, missing
+
     colors = requested_sort_colors(command)
+    if not colors and command_requests_color_sort(command):
+        goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+        colors = {color for color in goals if color in CONTROL_GOAL_TARGETS}
     if not colors:
         return None, []
     objects = (
@@ -2575,27 +3567,47 @@ def object_in_own_goal(snapshot: dict[str, Any], object_id: str | None) -> bool:
     if not isinstance(obj, dict):
         return False
     color = str(obj.get("color") or "")
-    goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
-    goal = goals.get(color)
-    return isinstance(goal, dict) and bool(
-        goal_containing_pose(obj.get("pose"), {color: goal})
-    )
+    return object_in_goal(snapshot, object_id, color)
 
 
 def task_satisfied_by_snapshot(task: str, snapshot: dict[str, Any]) -> bool:
     object_id = infer_task_object_id(task, snapshot)
     if object_id is None:
         return False
+    if task_destination_kind(task) == "handover":
+        return object_at_handover(snapshot, object_id)
+    explicit_goal_color = task_goal_color(task, snapshot)
+    if explicit_goal_color is not None:
+        return object_in_goal(snapshot, object_id, explicit_goal_color)
     return object_in_own_goal(snapshot, object_id)
+
+
+def first_unsatisfied_task_index(
+    tasks: list[str], snapshot: dict[str, Any]
+) -> int | None:
+    for index, task in enumerate(tasks):
+        if not task_satisfied_by_snapshot(task, snapshot):
+            return index
+    return None
+
+
+def verified_completed_tasks(
+    tasks: list[str], snapshot: dict[str, Any]
+) -> list[str]:
+    return [task for task in tasks if task_satisfied_by_snapshot(task, snapshot)]
 
 
 def baseline_sort_tasks_from_snapshot(
     command: str, snapshot: dict[str, Any]
 ) -> list[str]:
+    assignments = command_goal_assignments(command, snapshot)
     colors = requested_sort_colors(command)
-    if not colors:
+    if not colors and command_requests_color_sort(command):
+        goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+        colors = {color for color in goals if color in CONTROL_GOAL_TARGETS}
+    if not assignments and not colors:
         return []
-    summary = build_agent_world_summary(snapshot)
+    summary = build_agent_world_summary(snapshot, assignments)
     objects_by_id = summary.get("objects_by_id")
     if not isinstance(objects_by_id, dict):
         return []
@@ -2606,25 +3618,48 @@ def baseline_sort_tasks_from_snapshot(
         if not isinstance(obj, dict):
             continue
         color = str(obj.get("color") or "")
-        if color not in colors:
+        goal_color = assignments.get(object_id)
+        if goal_color is None:
+            if color not in colors:
+                continue
+            goal_color = color
+        if goal_color not in goals:
             continue
-        goal = goals.get(color)
-        if isinstance(goal, dict) and goal_containing_pose(
-            obj.get("pose"), {color: goal}
-        ):
+        goal = goals.get(goal_color)
+        if isinstance(goal, dict) and object_in_goal(snapshot, object_id, goal_color):
             continue
-        goal_id = obj.get("target_goal_id")
-        if not goal_id and isinstance(goal, dict):
-            goal_id = goal.get("id")
+        goal_id = goal.get("id") if isinstance(goal, dict) else None
         if not goal_id:
             continue
+        object_reach = obj.get("reach") if isinstance(obj.get("reach"), dict) else {}
+        goal_reach = (
+            summary.get("goals", {}).get(goal_color, {}).get("reach")
+            if isinstance(summary.get("goals"), dict)
+            and isinstance(summary.get("goals", {}).get(goal_color), dict)
+            else {}
+        )
         direct_candidates = (
-            obj.get("direct_robot_candidates")
-            if isinstance(obj.get("direct_robot_candidates"), list)
-            else []
+            [
+                robot_id
+                for robot_id in CONTROL_SERVICE_TOPICS
+                if reach_is_usable(object_reach.get(robot_id))
+                and isinstance(goal_reach, dict)
+                and reach_is_usable(goal_reach.get(robot_id))
+            ]
+            if goal_reach
+            else (
+                obj.get("direct_robot_candidates")
+                if isinstance(obj.get("direct_robot_candidates"), list)
+                else []
+            )
         )
         pickup_robot = obj.get("nearest_robot")
-        destination_robot = obj.get("destination_nearest_robot")
+        destination_robot = (
+            summary.get("goals", {}).get(goal_color, {}).get("nearest_robot")
+            if isinstance(summary.get("goals"), dict)
+            and isinstance(summary.get("goals", {}).get(goal_color), dict)
+            else obj.get("destination_nearest_robot")
+        )
         if (
             not direct_candidates
             and pickup_robot in CONTROL_SERVICE_TOPICS
@@ -2638,7 +3673,11 @@ def baseline_sort_tasks_from_snapshot(
                 f"{destination_robot} robot move {object_id} from table_center_handover to {goal_id}"
             )
             continue
-        robot_id = obj.get("preferred_direct_robot") or pickup_robot
+        robot_id = (
+            destination_robot
+            if destination_robot in direct_candidates
+            else obj.get("preferred_direct_robot") or pickup_robot
+        )
         if robot_id not in CONTROL_SERVICE_TOPICS:
             continue
         tasks.append(f"{robot_id} robot move {object_id} to {goal_id}")
@@ -2651,20 +3690,47 @@ def handover_tasks_for_task(task: str, snapshot: dict[str, Any]) -> list[str] | 
     object_id = infer_task_object_id(task, snapshot)
     if object_id is None:
         return None
-    if object_in_own_goal(snapshot, object_id):
+    goal_color = task_goal_color(task, snapshot)
+    if goal_color is None:
+        obj_for_goal = object_by_id(snapshot, object_id)
+        goal_color = (
+            str(obj_for_goal.get("color") or "")
+            if isinstance(obj_for_goal, dict)
+            else None
+        )
+    if object_in_goal(snapshot, object_id, goal_color):
         return None
-    summary = build_agent_world_summary(snapshot)
+    summary = build_agent_world_summary(
+        snapshot, {object_id: goal_color} if goal_color is not None else None
+    )
     obj = summary.get("objects_by_id", {}).get(object_id)
     if not isinstance(obj, dict):
         return None
-    goal_id = obj.get("target_goal_id")
-    pickup_robot = obj.get("nearest_robot")
-    destination_robot = obj.get("destination_nearest_robot")
-    direct_candidates = (
-        obj.get("direct_robot_candidates")
-        if isinstance(obj.get("direct_robot_candidates"), list)
-        else []
+    goal = (
+        summary.get("goals", {}).get(goal_color)
+        if isinstance(summary.get("goals"), dict)
+        else None
     )
+    goal_id = (
+        goal.get("id")
+        if isinstance(goal, dict)
+        else obj.get("requested_goal_id") or obj.get("default_same_color_goal_id")
+    )
+    pickup_robot = obj.get("nearest_robot")
+    destination_robot = (
+        goal.get("nearest_robot")
+        if isinstance(goal, dict) and goal.get("nearest_robot")
+        else obj.get("destination_nearest_robot")
+    )
+    object_reach = obj.get("reach") if isinstance(obj.get("reach"), dict) else {}
+    goal_reach = goal.get("reach") if isinstance(goal, dict) else {}
+    direct_candidates = [
+        robot_id
+        for robot_id in CONTROL_SERVICE_TOPICS
+        if reach_is_usable(object_reach.get(robot_id))
+        and isinstance(goal_reach, dict)
+        and reach_is_usable(goal_reach.get(robot_id))
+    ]
     if (
         direct_candidates
         or pickup_robot not in CONTROL_SERVICE_TOPICS
@@ -2677,6 +3743,125 @@ def handover_tasks_for_task(task: str, snapshot: dict[str, Any]) -> list[str] | 
         f"{pickup_robot} robot move {object_id} to table_center_handover for {destination_robot} robot handover",
         f"{destination_robot} robot move {object_id} from table_center_handover to {goal_id}",
     ]
+
+
+def handover_stage_for_task(task: str) -> str | None:
+    lowered = task.lower()
+    if "to table_center_handover" in lowered and "from table_center_handover" not in lowered:
+        return PICK_TO_HANDOVER
+    if "from table_center_handover" in lowered:
+        return HANDOVER_TO_GOAL
+    return None
+
+
+def recover_handover_failure(task: str, snapshot: dict[str, Any]) -> tuple[list[str] | None, str]:
+    object_id = infer_task_object_id(task, snapshot)
+    if object_id is None:
+        return None, RECOVER
+    stage = handover_stage_for_task(task)
+    at_handover = object_at_handover(snapshot, object_id)
+    if stage == PICK_TO_HANDOVER:
+        return None, VERIFY_HANDOVER if at_handover else PICK_TO_HANDOVER
+    if stage == HANDOVER_TO_GOAL:
+        if at_handover:
+            return None, HANDOVER_TO_GOAL
+        goal_color = task_goal_color(task, snapshot)
+        summary = build_agent_world_summary(
+            snapshot, {object_id: goal_color} if goal_color is not None else None
+        )
+        obj = summary.get("objects_by_id", {}).get(object_id)
+        goal = (
+            summary.get("goals", {}).get(goal_color)
+            if isinstance(summary.get("goals"), dict)
+            else None
+        )
+        pickup_robot = obj.get("nearest_robot") if isinstance(obj, dict) else None
+        destination_robot = infer_task_robot_id(task, snapshot)
+        goal_id = goal.get("id") if isinstance(goal, dict) else None
+        staged = (
+            [
+                f"{pickup_robot} robot move {object_id} to table_center_handover for {destination_robot} robot handover",
+                f"{destination_robot} robot move {object_id} from table_center_handover to {goal_id}",
+            ]
+            if pickup_robot in CONTROL_SERVICE_TOPICS
+            and destination_robot in CONTROL_SERVICE_TOPICS
+            and goal_id
+            else None
+        )
+        return staged, PICK_TO_HANDOVER if staged else RECOVER
+    return None, RECOVER
+
+
+def validate_llm_tasks(
+    command: str, snapshot: dict[str, Any], tasks: list[str], reporter: Reporter
+) -> list[str]:
+    assignments = command_goal_assignments(command, snapshot)
+    objects = snapshot.get("objects") if isinstance(snapshot.get("objects"), list) else []
+    known_object_ids = {
+        str(obj.get("id")) for obj in objects if isinstance(obj, dict) and obj.get("id")
+    }
+    goals = snapshot.get("goals") if isinstance(snapshot.get("goals"), dict) else {}
+    known_goal_ids = {
+        str(goal.get("id"))
+        for goal in goals.values()
+        if isinstance(goal, dict) and goal.get("id")
+    }
+    valid_tasks: list[str] = []
+    rejected: list[str] = []
+    for task in tasks:
+        object_id = infer_task_object_id(task, snapshot)
+        if object_id not in known_object_ids:
+            rejected.append(f"{task} :: unknown object_id")
+            continue
+        goal_color = task_goal_color(task, snapshot)
+        if "table_center_handover" not in task and goal_color is None:
+            rejected.append(f"{task} :: unknown goal_id")
+            continue
+        if goal_color is not None:
+            goal = goals.get(goal_color)
+            goal_id = str(goal.get("id")) if isinstance(goal, dict) else None
+            if goal_id not in known_goal_ids:
+                rejected.append(f"{task} :: missing goal marker")
+                continue
+            requested_goal = assignments.get(object_id)
+            if requested_goal is not None and goal_color != requested_goal:
+                rejected.append(
+                    f"{task} :: destination {goal_color} != requested {requested_goal}"
+                )
+                continue
+            if "table_center_handover" not in task:
+                summary = build_agent_world_summary(snapshot, {object_id: goal_color})
+                obj = summary.get("objects_by_id", {}).get(object_id)
+                goal_summary = (
+                    summary.get("goals", {}).get(goal_color)
+                    if isinstance(summary.get("goals"), dict)
+                    else None
+                )
+                object_reach = obj.get("reach") if isinstance(obj, dict) else {}
+                goal_reach = (
+                    goal_summary.get("reach") if isinstance(goal_summary, dict) else {}
+                )
+                direct_candidates = [
+                    robot_id
+                    for robot_id in CONTROL_SERVICE_TOPICS
+                    if reach_is_usable(object_reach.get(robot_id))
+                    and isinstance(goal_reach, dict)
+                    and reach_is_usable(goal_reach.get(robot_id))
+                ]
+                if not direct_candidates:
+                    rejected.append(f"{task} :: unreachable direct task")
+                    continue
+        valid_tasks.append(task)
+    if rejected:
+        reporter.status(
+            "Task filter",
+            {
+                "source": "runtime_llm_task_validation",
+                "rejected": len(rejected),
+                "details": rejected,
+            },
+        )
+    return valid_tasks
 
 
 def choose_task_list(
@@ -2707,6 +3892,7 @@ def choose_task_list(
             },
         )
         return baseline_tasks
+    llm_tasks = validate_llm_tasks(command, snapshot, llm_tasks, reporter)
     filtered_tasks = [
         task for task in llm_tasks if not task_satisfied_by_snapshot(task, snapshot)
     ]
@@ -2740,7 +3926,10 @@ def run() -> int:
         "Startup",
         {
             "cli": "multi_agent_chatgpt",
+            "mode": MODE,
             "model": OPENAI_MODEL,
+            "skip_troubleshooter": SKIP_TROUBLESHOOTER,
+            "use_llm_troubleshooter": USE_LLM_TROUBLESHOOTER,
             "action_interval_sec": ACTION_INTERVAL_SEC,
             "max_steps": MAX_MAIN_STEPS,
         },
@@ -2760,8 +3949,6 @@ def run() -> int:
         wait_for_ready(db_node, reporter)
         command = ask_user_command()
         snapshot, image_bytes = db_agent.snapshot()
-        llm_tasks = task_agent.decompose(command, snapshot, image_bytes)
-        tasks = choose_task_list(command, snapshot, llm_tasks, reporter)
         sort_complete, missing_objects = color_sort_completion_status(command, snapshot)
         if sort_complete is True:
             reporter.status(
@@ -2772,6 +3959,12 @@ def run() -> int:
                 },
             )
             return 0
+        baseline_tasks = baseline_sort_tasks_from_snapshot(command, snapshot)
+        if baseline_tasks:
+            tasks = choose_task_list(command, snapshot, baseline_tasks, reporter)
+        else:
+            llm_tasks = task_agent.decompose(command, snapshot, image_bytes)
+            tasks = choose_task_list(command, snapshot, llm_tasks, reporter)
         if not tasks:
             if missing_objects:
                 reporter.error(
@@ -2789,7 +3982,6 @@ def run() -> int:
             return 0
         completed_tasks: list[str] = []
         trouble_reports: list[dict[str, Any]] = []
-        task_index = 0
         replan_attempts: dict[int, int] = {}
 
         for step in range(1, MAX_MAIN_STEPS + 1):
@@ -2803,6 +3995,17 @@ def run() -> int:
                     {
                         "source": "world_state_color_sort",
                         "message": "All requested objects are in their target goal regions.",
+                    },
+                )
+                return 0
+            completed_tasks = verified_completed_tasks(tasks, snapshot)
+            next_index = first_unsatisfied_task_index(tasks, snapshot)
+            if next_index is None:
+                reporter.status(
+                    "Complete",
+                    {
+                        "source": "runtime_task_verifier",
+                        "message": "Every planned task is satisfied in the latest snapshot.",
                     },
                 )
                 return 0
@@ -2831,12 +4034,12 @@ def run() -> int:
                         },
                     )
                 else:
-                    if sort_complete is None and task_index < len(tasks):
+                    if sort_complete is None and next_index is not None:
                         reporter.status(
                             "Completion blocked",
                             {
                                 "reason": "MainAgent claimed completion before all planned tasks were consumed.",
-                                "task_index": task_index,
+                                "task_index": next_index,
                                 "tasks": len(tasks),
                                 "message": completion.get("message", ""),
                             },
@@ -2852,25 +4055,17 @@ def run() -> int:
                         )
                         return 0
 
-            if isinstance(completion.get("next_task_index"), int):
-                task_index = max(
-                    0, min(int(completion["next_task_index"]), len(tasks) - 1)
-                )
-            if task_index >= len(tasks):
-                task_index = max(0, len(tasks) - 1)
+            task_index = next_index
             task = tasks[task_index]
             if task_satisfied_by_snapshot(task, snapshot):
-                if task not in completed_tasks:
-                    completed_tasks.append(task)
                 reporter.status(
                     "Task skipped",
                     {
                         "source": "world_state_goal_membership",
                         "task": task,
-                        "reason": "The target object is already inside its own goal region.",
+                        "reason": "The task destination is already satisfied in the latest snapshot.",
                     },
                 )
-                task_index += 1
                 continue
             if trouble_reports and trouble_reports[-1].get("task") == task:
                 feedback = str(trouble_reports[-1].get("message", ""))
@@ -2883,9 +4078,13 @@ def run() -> int:
                 feedback
             ):
                 try:
-                    validate_action_sequence_against_snapshot(
-                        canonical_actions, snapshot
+                    canonical_actions = apply_alternate_destination_slot(
+                        canonical_actions,
+                        task,
+                        snapshot,
+                        replan_attempts.get(task_index, 0),
                     )
+                    validate_action_sequence_for_task(canonical_actions, task, snapshot)
                     actions = canonical_actions
                     plan_source = "control_service_baseline"
                     reporter.status(
@@ -2908,6 +4107,13 @@ def run() -> int:
                         actions = action_agent.make_actions(
                             task, snapshot, image_bytes, feedback=action_feedback
                         )
+                        actions = apply_alternate_destination_slot(
+                            actions,
+                            task,
+                            snapshot,
+                            replan_attempts.get(task_index, 0),
+                        )
+                        validate_action_sequence_for_task(actions, task, snapshot)
                         break
                     except Exception as exc:
                         action_feedback = (
@@ -2936,15 +4142,26 @@ def run() -> int:
                     )
                     continue
                 try:
-                    validate_action_sequence_against_snapshot(
-                        fallback_actions, snapshot
-                    )
+                    validate_action_sequence_for_task(fallback_actions, task, snapshot)
                 except Exception as exc:
                     reporter.error(
                         f"Baseline ControlCommand fallback plan was invalid for task {task}: {exc}"
                     )
                     continue
                 actions = fallback_actions
+                actions = apply_alternate_destination_slot(
+                    actions,
+                    task,
+                    snapshot,
+                    replan_attempts.get(task_index, 0),
+                )
+                try:
+                    validate_action_sequence_for_task(actions, task, snapshot)
+                except Exception as exc:
+                    reporter.error(
+                        f"Adjusted ControlCommand fallback plan was invalid for task {task}: {exc}"
+                    )
+                    continue
                 plan_source = "control_service_fallback"
                 reporter.status(
                     "ControlCommand baseline fallback",
@@ -2966,15 +4183,54 @@ def run() -> int:
 
             task_done = False
             for action_index, action in enumerate(actions, start=1):
+                fresh_snapshot, _ = db_agent.snapshot()
+                action = resolve_action_for_fresh_snapshot(
+                    action,
+                    task,
+                    fresh_snapshot,
+                    replan_attempts.get(task_index, 0),
+                )
                 reporter.status("Action", action.as_dict())
                 result = executor.execute(action)
                 snapshot_after, image_after = db_agent.snapshot()
-                if not result.success:
+                if SKIP_TROUBLESHOOTER:
+                    diagnosis = {
+                        "status": "success",
+                        "message": (
+                            "Post-action diagnosis skipped by SKIP_TROUBLESHOOTER=True; "
+                            f"treating action as OK. service_success={result.success}; "
+                            f"service_message={result.message}"
+                        ),
+                        "source": "troubleshooter_skipped",
+                    }
+                elif (
+                    not result.success
+                    and action.action == ACTION_RELEASE
+                    and "opening was not verified" in result.message
+                ):
+                    diagnosis = {
+                        "status": "retry",
+                        "message": (
+                            "Release command was sent but finger opening was not verified "
+                            f"from fresh joint state. {result.message}"
+                        ),
+                        "source": "runtime_release_assessment",
+                        "execution_diagnostics": build_execution_diagnostics(
+                            result, snapshot_after
+                        ),
+                    }
+                elif not result.success:
+                    ik_guidance = ik_rejection_guidance(result, snapshot_after)
                     diagnosis = {
                         "status": "replan_task",
                         "message": (
                             "ControlCommand was rejected or failed in world.py; "
                             f"the current action sequence is not executable as planned. {result.message}"
+                            + (f" {ik_guidance}" if ik_guidance else "")
+                        ),
+                        "source": "runtime_controlcommand_failure",
+                        "execution_diagnostics": build_execution_diagnostics(
+                            result, snapshot_after
                         ),
                     }
                 elif plan_source in {
@@ -2998,10 +4254,14 @@ def run() -> int:
                 else:
                     diagnosis = deterministic_grip_diagnosis(result, snapshot_after)
                     if diagnosis is None:
-                        diagnosis = deterministic_movement_diagnosis(
+                        diagnosis = deterministic_release_diagnosis(
                             result, snapshot_after
                         )
                     if diagnosis is None:
+                        diagnosis = deterministic_movement_diagnosis(
+                            result, snapshot_after
+                        )
+                    if diagnosis is None and USE_LLM_TROUBLESHOOTER:
                         diagnosis = troubleshooter.diagnose(
                             task,
                             result,
@@ -3016,53 +4276,10 @@ def run() -> int:
                                 item.as_dict() for item in actions[action_index:]
                             ],
                         )
-                pending_checks = 0
-                while (
-                    diagnosis.get("status") == "pending"
-                    and pending_checks < MAX_PENDING_DIAGNOSES
-                ):
-                    pending_checks += 1
-                    reporter.status(
-                        "Troubleshooter pending",
-                        {
-                            "check": pending_checks,
-                            "max": MAX_PENDING_DIAGNOSES,
-                            "message": diagnosis.get("message", ""),
-                        },
-                    )
-                    time.sleep(PENDING_OBSERVATION_SEC)
-                    snapshot_after, image_after = db_agent.snapshot()
-                    diagnosis = deterministic_grip_diagnosis(result, snapshot_after)
                     if diagnosis is None:
-                        diagnosis = deterministic_movement_diagnosis(
-                            result, snapshot_after
+                        diagnosis = accepted_action_success_diagnosis(
+                            result, snapshot_after, "runtime_default_success"
                         )
-                    if diagnosis is None:
-                        diagnosis = troubleshooter.diagnose(
-                            task,
-                            result,
-                            snapshot_after,
-                            image_after,
-                            action_index=action_index,
-                            total_actions=len(actions),
-                            previous_actions=[
-                                item.as_dict() for item in actions[: action_index - 1]
-                            ],
-                            remaining_actions=[
-                                item.as_dict() for item in actions[action_index:]
-                            ],
-                            pending_check_count=pending_checks,
-                        )
-                if diagnosis.get("status") == "pending":
-                    diagnosis = {
-                        **diagnosis,
-                        "status": "replan_task",
-                        "message": (
-                            "Troubleshooter kept the action pending until the observation limit was reached; "
-                            "runtime requests task replanning. "
-                            + str(diagnosis.get("message", ""))
-                        ),
-                    }
                 if diagnosis.get("status") == "complete" and action_index < len(
                     actions
                 ):
@@ -3070,14 +4287,15 @@ def run() -> int:
                         **diagnosis,
                         "status": "success",
                         "message": (
-                            "Troubleshooter returned complete for an intermediate primitive; "
+                            "Runtime check returned complete for an intermediate primitive; "
                             "runtime downgraded it to success and will continue the planned action sequence. "
                             + str(diagnosis.get("message", ""))
                         ),
                     }
-                diagnosis = enforce_runtime_safety_diagnosis(
-                    diagnosis, result, snapshot_after
-                )
+                if not SKIP_TROUBLESHOOTER:
+                    diagnosis = enforce_runtime_safety_diagnosis(
+                        diagnosis, result, snapshot_after
+                    )
                 diagnosis = {
                     **diagnosis,
                     "task": task,
@@ -3086,12 +4304,18 @@ def run() -> int:
                     "total_actions": len(actions),
                 }
                 trouble_reports.append(diagnosis)
-                status_panel = (
-                    "ControlCommand step"
-                    if diagnosis.get("source")
-                    in {"control_service_baseline", "control_service_fallback"}
-                    else "Troubleshooter"
-                )
+                diagnosis_source = str(diagnosis.get("source") or "")
+                if diagnosis_source in {
+                    "control_service_baseline",
+                    "control_service_fallback",
+                }:
+                    status_panel = "ControlCommand step"
+                elif diagnosis_source.startswith("runtime_"):
+                    status_panel = "Runtime check"
+                elif diagnosis_source == "troubleshooter_skipped":
+                    status_panel = "Runtime check"
+                else:
+                    status_panel = "Troubleshooter"
                 reporter.status(status_panel, diagnosis)
 
                 status = diagnosis.get("status")
@@ -3112,15 +4336,33 @@ def run() -> int:
             latest_status = (
                 trouble_reports[-1].get("status") if trouble_reports else "success"
             )
+            snapshot, image_bytes = db_agent.snapshot()
             if task_done or latest_status in {"success", "complete"}:
-                if task not in completed_tasks:
-                    completed_tasks.append(task)
-                task_index += 1
+                if task_satisfied_by_snapshot(task, snapshot):
+                    completed_tasks = verified_completed_tasks(tasks, snapshot)
+                    continue
+                trouble_reports.append(
+                    {
+                        "status": "replan_task",
+                        "message": (
+                            "Primitive sequence finished, but the fresh snapshot does not satisfy "
+                            "the task destination. Runtime will retry or replan instead of marking it complete."
+                        ),
+                        "source": "runtime_task_verifier",
+                        "task": task,
+                    }
+                )
+                latest_status = "replan_task"
+            if latest_status in {"success", "complete"}:
                 continue
             if latest_status == "replan_all":
                 snapshot, image_bytes = db_agent.snapshot()
-                llm_tasks = task_agent.decompose(command, snapshot, image_bytes)
-                tasks = choose_task_list(command, snapshot, llm_tasks, reporter)
+                baseline_tasks = baseline_sort_tasks_from_snapshot(command, snapshot)
+                if baseline_tasks:
+                    tasks = choose_task_list(command, snapshot, baseline_tasks, reporter)
+                else:
+                    llm_tasks = task_agent.decompose(command, snapshot, image_bytes)
+                    tasks = choose_task_list(command, snapshot, llm_tasks, reporter)
                 sort_complete, missing_objects = color_sort_completion_status(
                     command, snapshot
                 )
@@ -3149,20 +4391,42 @@ def run() -> int:
                     )
                     return 0
                 completed_tasks = []
-                task_index = 0
                 continue
             if latest_status == "replan_task":
                 snapshot, image_bytes = db_agent.snapshot()
                 if task_satisfied_by_snapshot(task, snapshot):
-                    if task not in completed_tasks:
-                        completed_tasks.append(task)
-                    task_index += 1
+                    completed_tasks = verified_completed_tasks(tasks, snapshot)
                     reporter.status(
                         "Task replan skipped",
                         {
                             "source": "world_state_goal_membership",
                             "task": task,
-                            "reason": "The target object reached its own goal region before replanning.",
+                            "reason": "The task destination became satisfied before replanning.",
+                        },
+                    )
+                    continue
+                handover_stage = handover_stage_for_task(task)
+                if handover_stage is not None:
+                    replacement_tasks, next_stage = recover_handover_failure(
+                        task, snapshot
+                    )
+                    if replacement_tasks:
+                        tasks = (
+                            tasks[:task_index]
+                            + replacement_tasks
+                            + tasks[task_index + 1 :]
+                        )
+                    reporter.status(
+                        "Task replan",
+                        {
+                            "source": "runtime_handover_state_machine",
+                            "old_task": task,
+                            "stage": handover_stage,
+                            "next_stage": next_stage,
+                            "object_at_handover": object_at_handover(
+                                snapshot, infer_task_object_id(task, snapshot)
+                            ),
+                            "replacement_tasks": replacement_tasks or [],
                         },
                     )
                     continue

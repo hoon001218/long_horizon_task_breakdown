@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 
 # Object count controls.
-NUM_CUBES = 5
+NUM_CUBES = 4
 NUM_CAPSULES = 0
 NUM_SPHERES = 0
 OBJECT_SIZE_SCALE = 0.5
@@ -57,13 +57,17 @@ CONTROL_SERVICE_TOPICS = {
 }
 CONTROL_SERVICE_TYPE = "custom_msgs/ControlCommand"
 CONTROL_SERVICE_TIMEOUT = 5.0
+RESET_SERVICE_TOPIC = "/world/reset"
+RESET_SERVICE_TYPE = "std_srvs/Trigger"
+RESET_SERVICE_TIMEOUT = 30.0
 ROS_TCP_RECONNECT_PERIOD_SEC = 3.0
 
 ACTION_MOVING = "Moving"
 ACTION_CENTERING = "Centering"
 ACTION_PLACING = "Placing"
 ACTION_GRIP = "Grip"
-ACTION_REALEASE = "Release"
+ACTION_RELEASE = "Release"
+ACTION_REALEASE = ACTION_RELEASE  # Backward-compatible alias for older clients.
 ACTION_HOMING = "Homing"
 
 CONTROL_MODE = "auto"  # "manual" or "auto"
@@ -79,8 +83,9 @@ AUTO_MOVE_POSITION_TOLERANCE = 0.008
 AUTO_MOVE_ORIENTATION_TOLERANCE = 0.07
 AUTO_MOVE_DWELL_SEC = 0.5
 AUTO_MOVE_HOME_CLEARANCE_Z_OFFSET = 0.05
-MOVING_GRASP_Z_OFFSET = -0.003
+MOVING_GRASP_Z_OFFSET = 0.0
 PLACEMENT_Z_OFFSET = 0.01
+CENTERING_Z_OFFSET = PLACEMENT_Z_OFFSET + 0.005
 
 OBJECT_COLORS = {
     "red": (0.95, 0.05, 0.05),
@@ -189,10 +194,13 @@ OBJECT_LINEAR_DAMPING = 1.0
 
 ROBOT_WORKSPACE_X_RANGE = (0.32, 0.84)
 ROBOT_WORKSPACE_Y_RANGE = (-0.26, 0.26)
-MIN_OBJECT_CLEARANCE = 0.035
+MIN_OBJECT_CLEARANCE = 0.045
 MAX_SPAWN_ATTEMPTS = 1000
-TABLE_SPAWN_INNER_SCALE = 0.68
-TABLE_CENTER_SPAWN_EXCLUSION_RADIUS = 0.05
+TABLE_EDGE_SPAWN_MARGIN = 0.035
+GOAL_SPAWN_EXCLUSION_MARGIN = 0.020
+SPAWN_GRID_DIVISIONS = 9
+SPAWN_LENGTH_ALLOWED_BANDS = (0, 1, 2, 6, 7, 8)  # OOOXXXOOO along table length.
+SPAWN_WIDTH_ALLOWED_BANDS = (2, 3, 4, 5, 6)  # XXOOOOOXX along table width.
 DROP_VARIATION_STEP = 0.032
 DROP_VARIATION_PATTERN = (
     np.array([1.0, 0.0]),
@@ -263,6 +271,14 @@ class PendingServiceRequest:
     service_topic: str
     srv_id: int
     request: ControlCommandRequest
+    done_event: threading.Event
+    response: ControlCommandResponse | None = None
+
+
+@dataclass
+class PendingResetRequest:
+    service_topic: str
+    srv_id: int
     done_event: threading.Event
     response: ControlCommandResponse | None = None
 
@@ -341,13 +357,36 @@ class QuaternionUtils:
 
 
 class CustomScene:
-    def __init__(self, seed: int | None) -> None:
+    SCENE_PRIM_PATHS = (
+        "/World/FrankaLeft",
+        "/World/FrankaRight",
+        "/World/Table",
+        "/World/TableRims",
+        "/World/GoalZones",
+        "/World/GoalZoneRims",
+        "/World/Objects",
+        "/World/PhysicsMaterials",
+        "/World/TopCamera",
+        "/World/TopCameraSoftbox",
+        "/World/ColorFillDomeLight",
+        "/World/defaultGroundPlane",
+    )
+
+    def __init__(self, seed: int | None, world: World | None = None) -> None:
         self.seed = seed
-        self.world = World(stage_units_in_meters=1.0)
+        self.world = world or World(stage_units_in_meters=1.0)
         self.frankas: dict[str, Robot] = {}
         self.top_camera: Camera | None = None
         self.object_material: PhysicsMaterial | None = None
         self.spawned_objects: list[SpawnedObject] = []
+
+    @staticmethod
+    def remove_scene_prims() -> None:
+        stage = get_current_stage()
+        for prim_path in sorted(CustomScene.SCENE_PRIM_PATHS, key=len, reverse=True):
+            path = Sdf.Path(prim_path)
+            if stage.GetPrimAtPath(path).IsValid():
+                stage.RemovePrim(path)
 
     def build(self, assets_root_path: str) -> None:
         self.add_ground()
@@ -407,27 +446,63 @@ class CustomScene:
             restitution=0.0,
         )
 
-    def table_limited_workspace(
+    def table_spawn_ranges(
         self, footprint_radius: float
-    ) -> tuple[tuple[float, float], tuple[float, float]]:
-        spawn_dims = TABLE_DIMS[:2] * TABLE_SPAWN_INNER_SCALE
-        table_x_min = TABLE_CENTER[0] - spawn_dims[0] / 2.0 + footprint_radius
-        table_x_max = TABLE_CENTER[0] + spawn_dims[0] / 2.0 - footprint_radius
-        table_y_min = TABLE_CENTER[1] - spawn_dims[1] / 2.0 + footprint_radius
-        table_y_max = TABLE_CENTER[1] + spawn_dims[1] / 2.0 - footprint_radius
-        x_range = (
-            table_x_min,
-            table_x_max,
+    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        x_ranges = self.axis_spawn_ranges(
+            TABLE_CENTER[0],
+            TABLE_DIMS[0],
+            SPAWN_LENGTH_ALLOWED_BANDS,
+            footprint_radius,
         )
-        y_range = (
-            table_y_min,
-            table_y_max,
+        y_ranges = self.axis_spawn_ranges(
+            TABLE_CENTER[1],
+            TABLE_DIMS[1],
+            SPAWN_WIDTH_ALLOWED_BANDS,
+            footprint_radius,
         )
-        if x_range[0] >= x_range[1] or y_range[0] >= y_range[1]:
+        if not x_ranges or not y_ranges:
             raise RuntimeError(
-                "Object footprint is too large for the configured robot workspace and table bounds."
+                "Object footprint is too large for the configured spawn grid bands."
             )
-        return x_range, y_range
+        return x_ranges, y_ranges
+
+    def axis_spawn_ranges(
+        self,
+        center: float,
+        extent: float,
+        allowed_bands: tuple[int, ...],
+        footprint_radius: float,
+    ) -> list[tuple[float, float]]:
+        table_min = center - extent / 2.0
+        band_size = extent / float(SPAWN_GRID_DIVISIONS)
+        ranges: list[tuple[float, float]] = []
+        sorted_bands = sorted(set(allowed_bands))
+        if not sorted_bands:
+            return ranges
+
+        group_start = sorted_bands[0]
+        group_end = sorted_bands[0]
+        groups: list[tuple[int, int]] = []
+        for band in sorted_bands[1:]:
+            if band == group_end + 1:
+                group_end = band
+                continue
+            groups.append((group_start, group_end))
+            group_start = band
+            group_end = band
+        groups.append((group_start, group_end))
+
+        for start_band, end_band in groups:
+            low = table_min + start_band * band_size + footprint_radius
+            high = table_min + (end_band + 1) * band_size - footprint_radius
+            if start_band == 0:
+                low += TABLE_EDGE_SPAWN_MARGIN
+            if end_band == SPAWN_GRID_DIVISIONS - 1:
+                high -= TABLE_EDGE_SPAWN_MARGIN
+            if low < high:
+                ranges.append((low, high))
+        return ranges
 
     def sample_non_overlapping_xy(
         self,
@@ -435,11 +510,11 @@ class CustomScene:
         footprint_radius: float,
         occupied: list[tuple[np.ndarray, float]],
     ) -> np.ndarray:
-        x_range, y_range = self.table_limited_workspace(footprint_radius)
+        x_ranges, y_ranges = self.table_spawn_ranges(footprint_radius)
         for _ in range(MAX_SPAWN_ATTEMPTS):
+            x_range = x_ranges[int(rng.integers(0, len(x_ranges)))]
+            y_range = y_ranges[int(rng.integers(0, len(y_ranges)))]
             xy = np.array([rng.uniform(*x_range), rng.uniform(*y_range)])
-            if self.inside_center_spawn_exclusion(xy, footprint_radius):
-                continue
             if self.overlaps_goal_zone(xy, footprint_radius):
                 continue
             if all(
@@ -453,15 +528,10 @@ class CustomScene:
             "Could not sample a non-overlapping object pose. Reduce object counts or sizes."
         )
 
-    def inside_center_spawn_exclusion(
-        self, xy: np.ndarray, footprint_radius: float
-    ) -> bool:
-        center_xy = TABLE_CENTER[:2]
-        exclusion_radius = TABLE_CENTER_SPAWN_EXCLUSION_RADIUS + footprint_radius
-        return float(np.linalg.norm(xy - center_xy)) <= exclusion_radius
-
     def overlaps_goal_zone(self, xy: np.ndarray, footprint_radius: float) -> bool:
-        clearance = footprint_radius + MIN_OBJECT_CLEARANCE
+        clearance = (
+            footprint_radius + MIN_OBJECT_CLEARANCE + GOAL_SPAWN_EXCLUSION_MARGIN
+        )
         for zone in GOAL_ZONES.values():
             center = zone["center"][:2]
             half_extents = GOAL_DIMS[:2] / 2.0 + clearance
@@ -1246,6 +1316,8 @@ class RosTcpClientBase:
         joint_state_publish_hz: float,
         control_service_topics: dict[str, str],
         control_service_type: str,
+        reset_service_topic: str,
+        reset_service_type: str,
         objects: list[SpawnedObject],
     ) -> None:
         self.host = host
@@ -1275,6 +1347,8 @@ class RosTcpClientBase:
             topic: robot_id for robot_id, topic in self.control_service_topics.items()
         }
         self.control_service_type = control_service_type
+        self.reset_service_topic = RosTopic.normalize(reset_service_topic)
+        self.reset_service_type = reset_service_type
         self.objects = objects
         self.frame_id = frame_id
         self.publish_period = 1.0 / max(publish_hz, 0.1)
@@ -1298,6 +1372,7 @@ class RosTcpClientBase:
         self.latest_joint_state: JointStateCommand | None = None
         self.pending_service_request_id: int | None = None
         self.pending_service_requests: list[PendingServiceRequest] = []
+        self.pending_reset_requests: list[PendingResetRequest] = []
         self.logged_first_publish = False
         self.logged_first_camera_image = False
         self.logged_first_joint_state = False
@@ -1357,6 +1432,7 @@ class RosTcpClientBase:
             self.pending_service_request_id = None
 
             self.register_ros_interfaces()
+            self.register_reset_service()
             self.send_syscommand(
                 "__publish",
                 {
@@ -1442,6 +1518,15 @@ class RosTcpClientBase:
             },
         )
 
+    def register_reset_service(self) -> None:
+        self.send_syscommand(
+            "__unity_service",
+            {
+                "topic": self.reset_service_topic,
+                "message_name": self.reset_service_type,
+            },
+        )
+
     def send_raw(self, packet: bytes) -> None:
         if self.socket is None and not self.try_connect():
             return
@@ -1499,6 +1584,12 @@ class RosTcpClientBase:
                 carb.log_error(
                     "ROS-TCP-Endpoint cannot import custom_msgs.srv.ControlCommand. "
                     "Rebuild custom_msgs, source this workspace before starting the endpoint, "
+                    "and restart ROS-TCP-Endpoint."
+                )
+            if "Unknown service class" in text and self.reset_service_type in text:
+                carb.log_error(
+                    "ROS-TCP-Endpoint cannot import std_srvs.srv.Trigger. "
+                    "Install/source std_srvs before starting the endpoint, "
                     "and restart ROS-TCP-Endpoint."
                 )
         elif command == "__warn":
@@ -1607,6 +1698,9 @@ class RosTcpClientBase:
         self.pending_service_request_id = None
         if srv_id is None:
             return
+        if destination == self.reset_service_topic:
+            self.handle_reset_service_payload(destination, srv_id)
+            return
         if destination not in self.control_service_topic_to_robot:
             response = ControlCommandResponse(
                 False, f"Unexpected service payload destination: {destination}"
@@ -1638,6 +1732,21 @@ class RosTcpClientBase:
             pending.response or ControlCommandResponse(False, "No response generated."),
         )
 
+    def handle_reset_service_payload(self, destination: str, srv_id: int) -> None:
+        pending = PendingResetRequest(destination, srv_id, threading.Event())
+        with self.service_lock:
+            self.pending_reset_requests.append(pending)
+
+        if not pending.done_event.wait(RESET_SERVICE_TIMEOUT):
+            pending.response = ControlCommandResponse(
+                False, "World reset handling timed out."
+            )
+        self.send_service_response(
+            destination,
+            srv_id,
+            pending.response or ControlCommandResponse(False, "No response generated."),
+        )
+
     def pop_service_requests(
         self, service_topic: str | None = None
     ) -> list[PendingServiceRequest]:
@@ -1660,6 +1769,18 @@ class RosTcpClientBase:
                     if request.service_topic != normalized_topic
                 ]
         return requests
+
+    def pop_reset_requests(self) -> list[PendingResetRequest]:
+        with self.service_lock:
+            requests = self.pending_reset_requests
+            self.pending_reset_requests = []
+        return requests
+
+    def update_scene_objects(self, objects: list[SpawnedObject]) -> None:
+        self.objects = objects
+        self.logged_first_publish = False
+        self.logged_first_camera_image = False
+        self.logged_first_joint_state_publish = False
 
     def send_service_response(
         self, service_topic: str, srv_id: int, response: ControlCommandResponse
@@ -1923,6 +2044,7 @@ class AutoController(BaseController):
         final_z_offset: float,
         final_relation: str,
     ) -> ControlCommandResponse:
+        previous_drop_variation_index = self.drop_variation_index
         fk_position, _ = self.compute_current_ee_pose(position_only=True)
         final_position = np.array(target_pose.position, dtype=np.float64)
         final_position[2] = float(target_pose.position[2]) + final_z_offset
@@ -1940,7 +2062,7 @@ class AutoController(BaseController):
         current_high_position[2] = transit_z
         target_high_position = np.array(final_position, dtype=np.float64)
         target_high_position[2] = transit_z
-        self.motion_phases = [
+        motion_phases = [
             MotionPhase(
                 current_high_position,
                 self.home_ee_orientation,
@@ -1953,6 +2075,19 @@ class AutoController(BaseController):
             ),
             MotionPhase(final_position, self.home_ee_orientation),
         ]
+        ik_failure = self.find_first_ik_failure(motion_phases)
+        if ik_failure is not None:
+            phase_index, failed_target = ik_failure
+            self.drop_variation_index = previous_drop_variation_index
+            return ControlCommandResponse(
+                False,
+                (
+                    f"Action '{action_name}' rejected: IK could not solve phase {phase_index + 1} "
+                    f"target position {failed_target.position.tolist()}."
+                ),
+            )
+
+        self.motion_phases = motion_phases
         self.phase_dwell_until = None
         return ControlCommandResponse(
             True,
@@ -1961,6 +2096,17 @@ class AutoController(BaseController):
                 f"horizontal XY motion at that clearance Z, 0.5s wait, then vertical descent to {final_relation}."
             ),
         )
+
+    def find_first_ik_failure(
+        self, motion_phases: list[MotionPhase]
+    ) -> tuple[int, MotionPhase] | None:
+        for phase_index, phase in enumerate(motion_phases):
+            _, success = self.compute_ik_action(
+                phase.position, phase.orientation_wxyz
+            )
+            if not success:
+                return phase_index, phase
+        return None
 
     def apply_drop_variation(
         self, final_position: np.ndarray, action_name: str
@@ -1989,14 +2135,14 @@ class AutoController(BaseController):
             target_pose,
             ACTION_MOVING,
             MOVING_GRASP_Z_OFFSET,
-            "slightly below the object marker pose for grasping",
+            "the object marker pose for grasping",
         )
 
     def center(self, target_pose: PoseCommand) -> ControlCommandResponse:
         return self.queue_vertical_horizontal_vertical_motion(
             target_pose,
             ACTION_CENTERING,
-            PLACEMENT_Z_OFFSET,
+            CENTERING_Z_OFFSET,
             "slightly above the center target",
         )
 
@@ -2073,7 +2219,10 @@ class AutoController(BaseController):
                     joint_positions[gripper_index] = self.gripper_target_positions[
                         target_offset
                     ]
-                if joint_velocities is not None and gripper_index < joint_velocities.shape[0]:
+                if (
+                    joint_velocities is not None
+                    and gripper_index < joint_velocities.shape[0]
+                ):
                     joint_velocities[gripper_index] = 0.0
                 if joint_efforts is not None and gripper_index < joint_efforts.shape[0]:
                     joint_efforts[gripper_index] = 0.0
@@ -2149,7 +2298,7 @@ class AutoController(BaseController):
         current_orientation = rot_matrices_to_quats(current_rotation)
         vertical_position = np.array(current_position, dtype=np.float64)
         vertical_position[2] = float(self.home_ee_position[2])
-        self.motion_phases = [
+        motion_phases = [
             MotionPhase(
                 vertical_position,
                 current_orientation,
@@ -2161,6 +2310,18 @@ class AutoController(BaseController):
                 apply_home_on_arrival=True,
             ),
         ]
+        ik_failure = self.find_first_ik_failure(motion_phases)
+        if ik_failure is not None:
+            phase_index, failed_target = ik_failure
+            return ControlCommandResponse(
+                False,
+                (
+                    f"Action '{ACTION_HOMING}' rejected: IK could not solve phase {phase_index + 1} "
+                    f"target position {failed_target.position.tolist()}."
+                ),
+            )
+
+        self.motion_phases = motion_phases
         return ControlCommandResponse(
             True,
             "Queued stop: vertical rise to home Z, 0.5s wait, then return to home pose; gripper unchanged.",
@@ -2210,6 +2371,65 @@ class AutoController(BaseController):
         self.home_applied = True
 
 
+def initialize_scene(scene: CustomScene, assets_root_path: str) -> None:
+    scene.build(assets_root_path)
+    if set(scene.frankas) != set(ROBOT_CONFIGS):
+        raise RuntimeError("Failed to create both Franka robots")
+    scene.world.reset()
+    scene.initialize_sensors()
+    scene.world.play()
+
+
+def create_controllers(
+    scene: CustomScene, control_mode: str
+) -> tuple[list[BaseController], dict[str, AutoController]]:
+    if control_mode == "manual":
+        return [ManualController(scene.frankas["left"])], {}
+    if control_mode == "auto":
+        controllers: list[BaseController] = [
+            AutoController(scene.frankas[robot_id], CONTROL_SERVICE_TOPICS[robot_id])
+            for robot_id in ("left", "right")
+        ]
+        auto_controllers = {
+            robot_id: controller
+            for robot_id, controller in zip(("left", "right"), controllers)
+            if isinstance(controller, AutoController)
+        }
+        for controller in controllers:
+            if isinstance(controller, AutoController):
+                controller.ensure_home_pose()
+        return controllers, auto_controllers
+    raise ValueError(f"Unsupported CONTROL_MODE: {control_mode}")
+
+
+def rebuild_scene(
+    current_scene: CustomScene,
+    assets_root_path: str,
+    control_mode: str,
+    ros_tcp_client: RosTcpClientBase,
+) -> tuple[CustomScene, list[BaseController], dict[str, AutoController]]:
+    carb.log_info("Rebuilding world from reset service request.")
+    current_scene.world.stop()
+    if hasattr(current_scene.world, "clear"):
+        try:
+            current_scene.world.clear()
+        except Exception as exc:
+            carb.log_warn(
+                f"World.clear() failed during reset; removing prims directly: {exc}"
+            )
+    CustomScene.remove_scene_prims()
+
+    scene = CustomScene(RANDOM_SEED, world=current_scene.world)
+    initialize_scene(scene, assets_root_path)
+    controllers, auto_controllers = create_controllers(scene, control_mode)
+    ros_tcp_client.update_scene_objects(scene.spawned_objects)
+    viewports.set_camera_view(
+        eye=np.array([1.7, 1.2, 1.0]), target=np.array([0.55, 0.0, 0.35])
+    )
+    carb.log_info("World rebuild complete.")
+    return scene, controllers, auto_controllers
+
+
 def main() -> None:
     control_mode = CONTROL_MODE.strip().lower()
     assets_root_path = get_assets_root_path()
@@ -2223,18 +2443,14 @@ def main() -> None:
     )
 
     scene = CustomScene(RANDOM_SEED)
-    scene.build(assets_root_path)
-    if set(scene.frankas) != set(ROBOT_CONFIGS):
-        carb.log_error("Failed to create both Franka robots")
+    try:
+        initialize_scene(scene, assets_root_path)
+    except Exception as exc:
+        carb.log_error(f"Failed to initialize world: {exc}")
         simulation_app.close()
         sys.exit(1)
-    scene.world.reset()
-    scene.initialize_sensors()
-    scene.world.play()
 
     ros_tcp_client: RosTcpClientBase
-    controllers: list[BaseController]
-    auto_controllers: dict[str, AutoController] = {}
     ros_kwargs = {
         "host": ROS_TCP_HOST,
         "port": ROS_TCP_PORT,
@@ -2250,27 +2466,17 @@ def main() -> None:
         "joint_state_publish_hz": JOINT_STATE_PUBLISH_HZ,
         "control_service_topics": CONTROL_SERVICE_TOPICS,
         "control_service_type": CONTROL_SERVICE_TYPE,
+        "reset_service_topic": RESET_SERVICE_TOPIC,
+        "reset_service_type": RESET_SERVICE_TYPE,
         "objects": scene.spawned_objects,
     }
     if control_mode == "manual":
         ros_tcp_client = ManualRosClient(**ros_kwargs)
-        controllers = [ManualController(scene.frankas["left"])]
     elif control_mode == "auto":
         ros_tcp_client = AutoRosClient(**ros_kwargs)
-        controllers = [
-            AutoController(scene.frankas[robot_id], CONTROL_SERVICE_TOPICS[robot_id])
-            for robot_id in ("left", "right")
-        ]
-        auto_controllers = {
-            robot_id: controller
-            for robot_id, controller in zip(("left", "right"), controllers)
-            if isinstance(controller, AutoController)
-        }
-        for controller in controllers:
-            if isinstance(controller, AutoController):
-                controller.ensure_home_pose()
     else:
-        raise ValueError(f"Unsupported CONTROL_MODE: {CONTROL_MODE}")
+        raise ValueError(f"Unsupported CONTROL_MODE: {control_mode}")
+    controllers, auto_controllers = create_controllers(scene, control_mode)
 
     reset_needed = False
     objects_spawned = False
@@ -2280,6 +2486,26 @@ def main() -> None:
     try:
         while simulation_app.is_running():
             scene.world.step(render=not HEADLESS)
+            reset_requests = ros_tcp_client.pop_reset_requests()
+            if reset_requests:
+                response = ControlCommandResponse(True, "World reset complete.")
+                try:
+                    scene, controllers, auto_controllers = rebuild_scene(
+                        scene, assets_root_path, control_mode, ros_tcp_client
+                    )
+                    reset_needed = False
+                    objects_spawned = False
+                    object_spawn_time = time.monotonic() + OBJECT_SPAWN_DELAY_SEC
+                except Exception as exc:
+                    carb.log_error(f"World reset failed: {exc}")
+                    response = ControlCommandResponse(
+                        False, f"World reset failed: {exc}"
+                    )
+                for pending in reset_requests:
+                    pending.response = response
+                    pending.done_event.set()
+                continue
+
             if not objects_spawned and time.monotonic() >= object_spawn_time:
                 scene.spawn_objects()
                 objects_spawned = True

@@ -1,0 +1,12 @@
+{
+  "run_id": "20260618_142542_360525_9075da6368",
+  "status": "completed",
+  "cli_returncode": 0,
+  "reset_returncode": 0,
+  "run_error": "",
+  "reset_error": "",
+  "bag_path": "/home/min/7cmdehdrb/long_horizon_task_breakdown/experiment_records/20260618_142542_360525_9075da6368/20260618_142542_360525_9075da6368",
+  "video_path": "/home/min/7cmdehdrb/long_horizon_task_breakdown/experiment_records/20260618_142542_360525_9075da6368/20260618_142542_360525_9075da6368.mp4",
+  "video_frames": 2051,
+  "video_codec": "mp4v"
+}
