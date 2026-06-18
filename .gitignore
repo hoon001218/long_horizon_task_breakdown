@@ -341,3 +341,4 @@ AMENT_IGNORE
 # End of https://www.toptal.com/developers/gitignore/api/ros,ros2
 
 /isaac-sim
+/data
