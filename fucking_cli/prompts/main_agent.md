@@ -61,6 +61,9 @@ Return only JSON:
 - If a pending task reason or previous failure mentions IK failure for direct Moving/Placing, prefer continuing with that task or requesting replan for a handoff strategy rather than aborting.
 - A valid handoff strategy is: source robot near object moves object to `table_center` with Centering, then final goal-side robot moves it from table center to `task.goal_id`.
 - Treat `Centering` as a legitimate intermediate step, not as task completion and not as a goal change.
+- In a handoff, switching from source robot to final/opposite robot requires Homing before the final/opposite robot moves.
+- Required handoff transition: source robot Centering, source robot Release, source robot Homing, final/opposite robot Homing, then final/opposite robot Moving.
+- If a plan or previous failure moved the opposite robot before Homing during a robot switch, request replan rather than continue that unsafe sequence.
 - A closed gripper before a pick attempt is not task completion and not a reason to abort by itself. It is a recoverable precondition issue.
 - If the selected task's robot gripper is not `open`, still select or continue the task when the object/goal IDs are valid; ActionAgent should open the gripper with `Release` before approaching.
 - If previous failure text mentions a closed gripper or failed grasp after approaching, prefer replan/continue with an open-gripper-first action sequence rather than repeating the same sequence.

@@ -73,6 +73,7 @@ Return only JSON:
 - If `replan_context` or previous task reasons mention a `Placing` IK failure for the source-side robot while placing into a far goal, interpret it as "the source robot should not place directly." The expected response is source robot to `table_center`, then final goal-side robot to the goal.
 - Do not assign a far source-side robot as the only robot for a far destination if that would require it to place directly into the distant goal. Mention the likely helper/final robot split in `reason`.
 - Useful reason wording: "Object is near left robot but destination is blue_goal/right side; use left as source helper to Centering/table_center, then right as final placing robot."
+- When describing a two-robot handoff, include that the source robot must Home after releasing at `table_center`, and the opposite/final robot must Home before moving toward the centered object.
 - If a robot's gripper is closed or not open in the Snapshot, do not mark the object task impossible for that reason alone. Mention that ActionAgent must open the gripper with `Release` before the pick approach.
 
 # Failure Handling

@@ -30,6 +30,7 @@ Return only JSON:
     {"action": "Centering", "robot_id": "existing robot id"},
     {"action": "Release", "robot_id": "existing robot id"},
     {"action": "Homing", "robot_id": "existing robot id"},
+    {"action": "Homing", "robot_id": "existing robot id"},
     {"action": "Moving", "robot_id": "existing robot id", "object_id": "existing object id"},
     {"action": "Grip", "robot_id": "existing robot id"},
     {"action": "Placing", "robot_id": "existing robot id", "goal_id": "existing goal id"},
@@ -60,10 +61,13 @@ Return only JSON:
   optional Release(final_robot if gripper is not open), Moving(object, final_robot), Grip(final_robot), Placing(goal, final_robot), Release(final_robot), Homing(final_robot).
 - If the object is far from the final placing robot, near the other robot, or a previous `Moving` action for the final placing robot failed with IK, use a two-robot handoff through table center.
 - Two-robot handoff sequence:
-  optional Release(source_robot if gripper is not open), Moving(object, source_robot), Grip(source_robot), Centering(source_robot), Release(source_robot), Homing(source_robot), optional Release(final_robot if gripper is not open), Moving(object, final_robot), Grip(final_robot), Placing(goal, final_robot), Release(final_robot), Homing(final_robot).
+  optional Release(source_robot if gripper is not open), Moving(object, source_robot), Grip(source_robot), Centering(source_robot), Release(source_robot), Homing(source_robot), Homing(final_robot), optional Release(final_robot if gripper is not open), Moving(object, final_robot), Grip(final_robot), Placing(goal, final_robot), Release(final_robot), Homing(final_robot).
 - In a handoff, `source_robot` is the robot closer to the object or more likely to reach the object pose. `final_robot` is the robot assigned to the destination goal, usually `snapshot.goals[*].robot_id` for `task.goal_id`.
 - Centering means the source robot moves the held object to `table_center` so the final robot can pick it up. Do not attempt to make the source robot place directly into a far goal after a placing or moving IK failure.
-- After Centering, Release before the final robot tries to pick the object. Home the source robot before the final robot approaches when possible.
+- After Centering, Release before the final robot tries to pick the object.
+- When switching from one robot to the other in the middle of a handoff, the opposite/new robot must execute `Homing` before any `Moving` action. This is mandatory even if the new robot appears idle.
+- Handoff transition order is mandatory: source robot Centering, source robot Release, source robot Homing, final robot Homing, then final robot Moving to the object.
+- Do not move the final/opposite robot toward the object until both the source robot has homed after releasing and the final/opposite robot has homed.
 - In a two-robot handoff, check both robots' gripper state before their respective pick attempts. The source robot must be open before the first Moving-to-object, and the final robot must be open before the second Moving-to-object.
 
 # Failure Handling

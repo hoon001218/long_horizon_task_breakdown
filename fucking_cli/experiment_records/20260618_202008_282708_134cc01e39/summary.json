@@ -1,0 +1,13 @@
+{
+  "run_id": "20260618_202008_282708_134cc01e39",
+  "command": "Move all objects to blue goal.",
+  "status": "completed",
+  "main_returncode": 0,
+  "reset_returncode": 0,
+  "run_error": "",
+  "reset_error": "",
+  "bag_path": "/home/min/7cmdehdrb/long_horizon_task_breakdown/fucking_cli/experiment_records/20260618_202008_282708_134cc01e39/20260618_202008_282708_134cc01e39",
+  "video_path": "/home/min/7cmdehdrb/long_horizon_task_breakdown/fucking_cli/experiment_records/20260618_202008_282708_134cc01e39/20260618_202008_282708_134cc01e39.mp4",
+  "video_frames": 1028,
+  "video_codec": "mp4v"
+}

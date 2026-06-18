@@ -49,6 +49,9 @@ Return only JSON:
 - If `before_snapshot.robots[robot_id].gripper.state` is not `open` before a pick attempt, recommend replanning with `Release(robot_id)` before `Moving`.
 - If a failed run leaves a gripper closed or moving, do not keep retrying the same pick sequence. The next plan must open the gripper first.
 - A preparatory `Release` before object approach is an appropriate corrective action when the gripper is closed, even if no object is currently held.
+- In a two-robot handoff, verify that the source robot homes after Centering/Release and that the opposite/final robot homes before its first Moving action.
+- If the plan switches robots and the new/opposite robot moves before Homing, treat the plan as unsafe or incomplete and request replan.
+- Correct handoff transition suggestion: source Centering, source Release, source Homing, final/opposite Homing, then final/opposite Moving.
 
 # Failure Handling
 
@@ -57,3 +60,4 @@ Return only JSON:
 - Use `replan` when a different robot assignment may be needed after IK failure.
 - Use `replan` with a suggestion for Centering/table-center handoff when direct single-robot transfer fails because of reachability.
 - Use `replan` when the action sequence omitted an opening `Release` before a pick attempt with a closed/non-open gripper.
+- Use `replan` when a robot switch occurs without Homing the newly active/opposite robot before it moves.
